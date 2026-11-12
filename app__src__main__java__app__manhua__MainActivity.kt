@@ -31,11 +31,13 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.app.AlertDialog
 import android.widget.*
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -92,6 +94,7 @@ class MainActivity : Activity() {
     private val items = mutableListOf<Pair<Double, String>>()
     private val memo = HashMap<String, String>()
     private val glossary = LinkedHashMap<String, String>()
+    private val userGl = LinkedHashMap<String, String>()
     private var cues = listOf<Cue>()
     private var done = 0.0
     private var savedTop = 80
@@ -120,6 +123,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        loadGl()
         val d = resources.displayMetrics.density
         fun dp(x: Int) = (x * d).toInt()
         fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
@@ -160,9 +164,16 @@ class MainActivity : Activity() {
         col.addView(btn("Arrêter (la progression est gardée)") { stop = true })
         playB = btn("3. Lire avec sous-titres") { play() }.also { it.isEnabled = false }
         col.addView(playB)
+        col.addView(btn("Mon glossaire (noms et termes)") { editGlossary() })
+        col.addView(btn("Retraduire avec le glossaire (garde l’analyse)") {
+            if (!running && uri != null) {
+                memo.clear(); saveState(); playB.isEnabled = false
+                st.text = "Traductions effacées. Appuie sur « 2 » pour retraduire avec ton glossaire."
+            }
+        })
         col.addView(btn("Effacer la progression") {
             if (!running) {
-                items.clear(); memo.clear(); glossary.clear(); done = 0.0; cues = listOf()
+                items.clear(); memo.clear(); done = 0.0; cues = listOf()
                 uri?.let { sf().delete() }
                 playB.isEnabled = false; st.text = "Progression effacée."
             }
@@ -185,6 +196,65 @@ class MainActivity : Activity() {
             addView(ScrollView(this@MainActivity).apply { addView(col) })
             addView(box)
         })
+    }
+
+    private fun loadGl() {
+        try {
+            val f = File(filesDir, "glossaire.json"); if (!f.exists()) return
+            val o = JSONObject(f.readText())
+            o.optJSONObject("user")?.let { m -> m.keys().forEach { userGl[it] = m.getString(it) } }
+            o.optJSONObject("learned")?.let { m -> m.keys().forEach { glossary[it] = m.getString(it) } }
+        } catch (e: Exception) {}
+    }
+
+    @Synchronized private fun saveGl() {
+        try {
+            File(filesDir, "glossaire.json").writeText(
+                JSONObject().put("user", JSONObject(userGl.toMap())).put("learned", JSONObject(glossary.toMap())).toString())
+        } catch (e: Exception) {}
+    }
+
+    private fun editGlossary() {
+        val all = LinkedHashMap<String, String>(); all.putAll(glossary); all.putAll(userGl)
+        val et = EditText(this).apply {
+            setText(all.entries.joinToString("\n") { "${it.key} = ${it.value}" })
+            minLines = 8; gravity = Gravity.TOP
+        }
+        AlertDialog.Builder(this).setTitle("Mon glossaire : chinois = arabe")
+            .setMessage("Une ligne par terme. Ces traductions passent avant tout le reste, en ligne et hors ligne.")
+            .setView(ScrollView(this).apply { addView(et) })
+            .setPositiveButton("Enregistrer") { _, _ ->
+                userGl.clear(); glossary.clear()
+                et.text.toString().lines().forEach { l ->
+                    val i = l.indexOf('=')
+                    if (i > 0) {
+                        val k = l.substring(0, i).trim(); val v = l.substring(i + 1).trim()
+                        if (k.isNotEmpty() && v.isNotEmpty()) userGl[k] = v
+                    }
+                }
+                saveGl()
+            }.setNegativeButton("Annuler", null).show()
+    }
+
+    private fun offlineLine(tr: Translator, zh: String): String {
+        userGl[zh]?.let { return it }
+        val terms = (userGl.keys + glossary.keys).filter { it.length >= 2 && zh.contains(it) }.sortedByDescending { it.length }
+        if (terms.isEmpty()) return Tasks.await(tr.translate(zh))
+        var parts = listOf(false to zh)
+        for (t in terms) {
+            val np = mutableListOf<Pair<Boolean, String>>()
+            for ((isTerm, txt) in parts) {
+                if (isTerm || !txt.contains(t)) { np.add(isTerm to txt); continue }
+                txt.split(t).forEachIndexed { i, piece ->
+                    if (i > 0) np.add(true to t)
+                    if (piece.isNotBlank()) np.add(false to piece)
+                }
+            }
+            parts = np
+        }
+        return parts.joinToString(" ") { (isTerm, txt) ->
+            if (isTerm) (userGl[txt] ?: glossary[txt] ?: txt) else Tasks.await(tr.translate(txt))
+        }.trim()
     }
 
     private fun notifyProgress(t: String) {
@@ -261,17 +331,17 @@ class MainActivity : Activity() {
         o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
         o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap()))
         sf().writeText(o.toString())
+        saveGl()
     }
 
     private fun loadState() {
-        items.clear(); memo.clear(); glossary.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
+        items.clear(); memo.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
         val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
         done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
         val a = o.getJSONArray("items")
         for (i in 0 until a.length()) { val x = a.getJSONArray(i); items.add(x.getDouble(0) to x.getString(1)) }
         val m = o.getJSONObject("memo"); m.keys().forEach { memo[it] = m.getString(it) }
-        val g = o.getJSONObject("g"); g.keys().forEach { glossary[it] = g.getString(it) }
         if (items.isNotEmpty()) { cues = buildCues(); cues.forEach { it.ar = memo[it.zh] ?: "" } }
     }
 
@@ -400,13 +470,14 @@ class MainActivity : Activity() {
         for (c in list) {
             if (stop) return
             if (memo[c.zh] != null) continue
-            memo[c.zh] = Tasks.await(tr.translate(c.zh))
+            memo[c.zh] = offlineLine(tr, c.zh)
             if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState() }
         }
     }
 
     private fun translateAll(key: String) {
         fellBack = false
+        cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
         if (key.isEmpty()) { offlineTranslate(todo()); return }
         while (!stop) {
@@ -432,11 +503,15 @@ class MainActivity : Activity() {
     }
 
     private fun prompt(ctx: List<Cue>, b: List<Cue>): String {
+        val src = (ctx.map { it.zh } + b.map { it.zh }).joinToString("\n")
+        val rel = LinkedHashMap<String, String>()
+        for ((k, v) in glossary) if (src.contains(k)) rel[k] = v
+        for ((k, v) in userGl) if (src.contains(k)) rel[k] = v
         val p = StringBuilder()
         p.append("Tu traduis les sous-titres d’un manhua raconté (chinois) en arabe standard moderne, naturel et fidèle. ")
         p.append("Garde la logique et la continuité du discours : résous les sujets et pronoms omis d’après le contexte, ")
         p.append("garde les mêmes termes et la même transcription des noms propres (glossaire), le même ton et le même registre. ")
-        p.append("Ne résume pas, ne commente pas.\n\nGlossaire actuel : ").append(JSONObject(glossary.toMap())).append("\n\n")
+        p.append("Ne résume pas, ne commente pas.\n\nGlossaire à respecter exactement : ").append(JSONObject(rel.toMap())).append("\n\n")
         if (ctx.isNotEmpty()) {
             p.append("Contexte déjà traduit (ne pas retraduire) :\n")
             ctx.forEach { p.append(it.zh).append(" => ").append(memo[it.zh]).append("\n") }
@@ -452,8 +527,8 @@ class MainActivity : Activity() {
         val j = JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1))
         val arr = j.getJSONArray("t")
         if (arr.length() != n) throw Exception("nombre de lignes différent")
-        j.optJSONObject("g")?.let { g -> g.keys().forEach { glossary[it] = g.getString(it) } }
-        while (glossary.size > 80) glossary.remove(glossary.keys.first())
+        j.optJSONObject("g")?.let { g -> g.keys().forEach { if (!glossary.containsKey(it) && !userGl.containsKey(it)) glossary[it] = g.getString(it) } }
+        while (glossary.size > 5000) glossary.remove(glossary.keys.first())
         return List(arr.length()) { arr.getString(it) }
     }
 
