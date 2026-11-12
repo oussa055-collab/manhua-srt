@@ -97,6 +97,7 @@ class MainActivity : Activity() {
     private var savedTop = 80
     private var savedBot = 98
     private var savedStart = 0.0
+    @Volatile private var fellBack = false
     private var rEnd = 0.0
     @Volatile private var stop = false
     @Volatile private var running = false
@@ -377,7 +378,7 @@ class MainActivity : Activity() {
                 val inTree = exportAll()
                 val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
                 val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
-                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote")
+                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote" + if (fellBack) " Une partie a été traduite hors ligne (quota gratuit atteint)." else "")
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
                 try { saveState() } catch (x: Exception) {}
@@ -390,27 +391,39 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun translateAll(key: String) {
-        fun todo() = cues.filter { memo[it.zh] == null }
-        if (key.isEmpty()) {
-            val tr = Translation.getClient(TranslatorOptions.Builder()
-                .setSourceLanguage(TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
-            ui("Téléchargement du modèle hors ligne (une seule fois)…")
-            Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
-            var n = 0
-            for (c in todo()) {
-                if (stop) return
-                memo[c.zh] = Tasks.await(tr.translate(c.zh))
-                if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState() }
-            }
-            return
+    private fun offlineTranslate(list: List<Cue>) {
+        val tr = Translation.getClient(TranslatorOptions.Builder()
+            .setSourceLanguage(TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
+        ui("Téléchargement du modèle hors ligne (une seule fois)…")
+        Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+        var n = 0
+        for (c in list) {
+            if (stop) return
+            if (memo[c.zh] != null) continue
+            memo[c.zh] = Tasks.await(tr.translate(c.zh))
+            if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState() }
         }
+    }
+
+    private fun translateAll(key: String) {
+        fellBack = false
+        fun todo() = cues.filter { memo[it.zh] == null }
+        if (key.isEmpty()) { offlineTranslate(todo()); return }
         while (!stop) {
             val gem = !key.startsWith("sk-")
             val b = todo().take(if (gem) 40 else 25); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
-            val res = if (gem) gemini(key, ctx, b) else claude(key, ctx, b)
+            val res = try {
+                if (gem) gemini(key, ctx, b) else claude(key, ctx, b)
+            } catch (e: ApiErr) {
+                if (e.code != 429) throw e
+                fellBack = true
+                saveState()
+                ui("Quota gratuit atteint : passage automatique à la traduction hors ligne…")
+                offlineTranslate(todo())
+                return
+            }
             b.forEachIndexed { j, c -> memo[c.zh] = res[j] }
             ui("Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size}")
             notifyProgress("Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size}")
@@ -489,9 +502,7 @@ class MainActivity : Activity() {
                 Thread.sleep(if (e is ApiErr && e.code == 429) 25000L else 4000L * a)
             }
         }
-        val e = err
-        if (e is ApiErr && e.code == 429) throw Exception("Quota gratuit Gemini atteint (par minute ou par jour) : attends un peu ou reviens demain")
-        throw e!!
+        throw err!!
     }
 
     private fun ts(t: Double): String {
