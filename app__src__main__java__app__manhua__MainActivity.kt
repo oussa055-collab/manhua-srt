@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.InputType
@@ -49,6 +50,8 @@ class MainActivity : Activity() {
     private var done = 0.0
     private var savedTop = 80
     private var savedBot = 98
+    private var savedStart = 0.0
+    private var rEnd = 0.0
     @Volatile private var stop = false
     @Volatile private var running = false
     private var preview: Bitmap? = null
@@ -59,6 +62,9 @@ class MainActivity : Activity() {
     private lateinit var sTop: SeekBar
     private lateinit var sBot: SeekBar
     private lateinit var key: EditText
+    private lateinit var etFrom: EditText
+    private lateinit var etTo: EditText
+    private lateinit var treeTv: TextView
     private lateinit var goB: Button
     private lateinit var playB: Button
     private lateinit var box: FrameLayout
@@ -94,6 +100,14 @@ class MainActivity : Activity() {
             setText(getSharedPreferences("p", 0).getString("k", ""))
         }
         col.addView(key)
+        etFrom = EditText(this).apply { hint = "Début de l’analyse (minutes)"; setText("0"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+        etTo = EditText(this).apply { hint = "Fin (minutes, 0 = toute la vidéo)"; setText("5"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+        col.addView(etFrom); col.addView(etTo)
+        col.addView(btn("Choisir le dossier de sortie (celui de la vidéo)") {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 2)
+        })
+        treeTv = TextView(this).apply { text = treeLabel() }
+        col.addView(treeTv)
         goB = btn("2. Analyser et traduire") { start() }.also { it.isEnabled = false }
         col.addView(goB)
         col.addView(btn("Arrêter (la progression est gardée)") { stop = true })
@@ -126,7 +140,20 @@ class MainActivity : Activity() {
         })
     }
 
+    private fun treeLabel(): String =
+        getSharedPreferences("p", 0).getString("tree", null)?.let { "Dossier de sortie : " + DocumentsContract.getTreeDocumentId(Uri.parse(it)) }
+            ?: "Dossier de sortie : Téléchargements (par défaut)"
+
     override fun onActivityResult(rq: Int, rc: Int, d: Intent?) {
+        if (rq == 2) {
+            val tu = d?.data
+            if (rc == RESULT_OK && tu != null) {
+                try { contentResolver.takePersistableUriPermission(tu, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (e: Exception) {}
+                getSharedPreferences("p", 0).edit().putString("tree", tu.toString()).apply()
+                treeTv.text = treeLabel()
+            }
+            return
+        }
         val u = d?.data ?: return
         if (rc != RESULT_OK) return
         try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
@@ -144,7 +171,7 @@ class MainActivity : Activity() {
                 r.release()
                 try { loadState() } catch (e: Exception) { items.clear(); memo.clear(); done = 0.0 }
                 runOnUiThread {
-                    if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot }
+                    if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText((savedStart / 60).toString()) }
                     drawPreview(); goB.isEnabled = true
                     playB.isEnabled = cues.isNotEmpty() && cues.all { it.ar.isNotEmpty() }
                     st.text = "Durée ${hms(durMs / 1000.0)}." + if (items.isNotEmpty()) " Progression retrouvée : ${hms(done)}." else " Ajuste la zone rouge puis lance l’analyse."
@@ -169,17 +196,17 @@ class MainActivity : Activity() {
     }
 
     @Synchronized private fun saveState() {
-        val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot)
+        val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot).put("rs", savedStart)
         o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
         o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap()))
         sf().writeText(o.toString())
     }
 
     private fun loadState() {
-        items.clear(); memo.clear(); glossary.clear(); done = 0.0; cues = listOf()
+        items.clear(); memo.clear(); glossary.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
         val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
-        done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98)
+        done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
         val a = o.getJSONArray("items")
         for (i in 0 until a.length()) { val x = a.getJSONArray(i); items.add(x.getDouble(0) to x.getString(1)) }
         val m = o.getJSONObject("memo"); m.keys().forEach { memo[it] = m.getString(it) }
@@ -220,7 +247,7 @@ class MainActivity : Activity() {
     }
 
     private fun buildCues(): List<Cue> {
-        val out = mutableListOf<Cue>(); val hh = STEP / 2; val dur = durMs / 1000.0
+        val out = mutableListOf<Cue>(); val hh = STEP / 2; val dur = if (rEnd > 0) rEnd else durMs / 1000.0
         for (k in items.indices) {
             val (t, zh) = items[k]; if (zh.isEmpty()) continue
             val s0 = maxOf(0.0, t - hh)
@@ -238,13 +265,19 @@ class MainActivity : Activity() {
         val k = key.text.toString().trim()
         getSharedPreferences("p", 0).edit().putString("k", k).apply()
         val ct = sTop.progress; val cb = sBot.progress
-        if (items.isNotEmpty() && (savedTop != ct || savedBot != cb)) { items.clear(); memo.clear(); glossary.clear(); done = 0.0 }
-        savedTop = ct; savedBot = cb
+        val full = durMs / 1000.0
+        val rs = ((etFrom.text.toString().toDoubleOrNull() ?: 0.0) * 60).coerceAtLeast(0.0)
+        val reRaw = (etTo.text.toString().toDoubleOrNull() ?: 0.0) * 60
+        val re = if (reRaw <= 0.0 || reRaw > full) full else reRaw
+        if (re <= rs) { st.text = "La fin doit être après le début."; return }
+        if (savedTop != ct || savedBot != cb || savedStart != rs) { items.clear(); done = 0.0 }
+        done = maxOf(done, rs)
+        savedTop = ct; savedBot = cb; savedStart = rs; rEnd = re
         running = true; stop = false; goB.isEnabled = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         Thread {
             try {
-                val dur = durMs / 1000.0
+                val dur = re
                 if (done < dur) {
                     val r = retr()
                     val rec = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
@@ -277,8 +310,11 @@ class MainActivity : Activity() {
                 translateAll(key = k)
                 if (stop) { saveState(); ui("Arrêté pendant la traduction. Relance pour reprendre."); return@Thread }
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
-                saveState(); exportAll()
-                ui("Terminé ✓ ${cues.size} sous-titres. Fichiers dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt")
+                saveState()
+                val inTree = exportAll()
+                val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
+                val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
+                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote")
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
                 try { saveState() } catch (x: Exception) {}
@@ -367,7 +403,29 @@ class MainActivity : Activity() {
     private fun srt(sel: (Cue) -> String) =
         cues.withIndex().joinToString("\n") { (i, c) -> "${i + 1}\n${ts(c.start)} --> ${ts(c.end)}\n${sel(c)}\n" }
 
-    private fun exportAll() {
+    private fun putTree(tree: Uri, name: String, text: String) {
+        val tid = DocumentsContract.getTreeDocumentId(tree)
+        val parent = DocumentsContract.buildDocumentUriUsingTree(tree, tid)
+        val kids = DocumentsContract.buildChildDocumentsUriUsingTree(tree, tid)
+        contentResolver.query(kids, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
+            while (c.moveToNext()) if (c.getString(1) == name) {
+                try { DocumentsContract.deleteDocument(contentResolver, DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0))) } catch (e: Exception) {}
+            }
+        }
+        val u = DocumentsContract.createDocument(contentResolver, parent, "application/x-subrip", name) ?: throw Exception("création impossible")
+        contentResolver.openOutputStream(u)!!.use { it.write(("\uFEFF" + text).toByteArray()) }
+    }
+
+    private fun exportAll(): Boolean {
+        val tree = getSharedPreferences("p", 0).getString("tree", null)?.let { Uri.parse(it) }
+        if (tree != null) {
+            try {
+                putTree(tree, "$base.srt", srt { it.ar })
+                putTree(tree, "$base.zh.srt", srt { it.zh })
+                putTree(tree, "$base.bilingue.srt", srt { it.zh + "\n" + it.ar })
+                return true
+            } catch (e: Exception) {}
+        }
         fun put(name: String, text: String) {
             val v = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, name)
@@ -379,6 +437,7 @@ class MainActivity : Activity() {
         put("$base.ar.srt", srt { it.ar })
         put("$base.zh.srt", srt { it.zh })
         put("$base.bilingue.srt", srt { it.zh + "\n" + it.ar })
+        return false
     }
 
     private fun play() {
