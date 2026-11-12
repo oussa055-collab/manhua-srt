@@ -1,6 +1,18 @@
 package app.manhua
 
 import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
@@ -37,6 +49,40 @@ import java.net.URL
 import kotlin.math.abs
 
 class Cue(var start: Double, var end: Double, var zh: String, var ar: String = "")
+
+class ApiErr(val code: Int) : Exception("API $code")
+
+fun ensureChannel(c: Context) {
+    c.getSystemService(NotificationManager::class.java)
+        .createNotificationChannel(NotificationChannel("work", "Analyse en cours", NotificationManager.IMPORTANCE_LOW))
+}
+
+fun buildNotif(c: Context, text: String): Notification {
+    val pi = PendingIntent.getActivity(
+        c, 0, Intent(c, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
+        PendingIntent.FLAG_IMMUTABLE
+    )
+    return Notification.Builder(c, "work").setContentTitle("Manhua SRT").setContentText(text)
+        .setSmallIcon(android.R.drawable.stat_notify_sync).setContentIntent(pi).setOngoing(true).build()
+}
+
+class KeepAliveService : Service() {
+    private var wl: PowerManager.WakeLock? = null
+    override fun onBind(i: Intent?): IBinder? = null
+    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+        ensureChannel(this)
+        startForeground(1, buildNotif(this, "Analyse en cours…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        if (wl == null) {
+            wl = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "manhua:work")
+            wl?.acquire(15 * 60 * 60 * 1000L)
+        }
+        return START_NOT_STICKY
+    }
+    override fun onDestroy() {
+        try { wl?.release() } catch (e: Exception) {}
+        super.onDestroy()
+    }
+}
 
 class MainActivity : Activity() {
     private val STEP = 1.0
@@ -95,7 +141,7 @@ class MainActivity : Activity() {
         sTop = bar(95, 80); sBot = bar(100, 98)
         col.addView(sTop); col.addView(sBot)
         key = EditText(this).apply {
-            hint = "Clé API Claude (vide = traduction hors ligne ML Kit)"
+            hint = "Clé API : Gemini gratuite (AIza…) ou Claude. Vide = hors ligne"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setText(getSharedPreferences("p", 0).getString("k", ""))
         }
@@ -138,6 +184,20 @@ class MainActivity : Activity() {
             addView(ScrollView(this@MainActivity).apply { addView(col) })
             addView(box)
         })
+    }
+
+    private fun notifyProgress(t: String) {
+        getSystemService(NotificationManager::class.java).notify(1, buildNotif(this, t))
+    }
+
+    private fun askBackground() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 3)
+        }
+        val pm = getSystemService(PowerManager::class.java)
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
+        }
     }
 
     private fun treeLabel(): String =
@@ -275,6 +335,9 @@ class MainActivity : Activity() {
         savedTop = ct; savedBot = cb; savedStart = rs; rEnd = re
         running = true; stop = false; goB.isEnabled = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        ensureChannel(this)
+        startForegroundService(Intent(this, KeepAliveService::class.java))
+        askBackground()
         Thread {
             try {
                 val dur = re
@@ -298,7 +361,7 @@ class MainActivity : Activity() {
                             f.recycle()
                         }
                         t += STEP; done = t
-                        if (System.currentTimeMillis() - ls > 20000) { saveState(); ls = System.currentTimeMillis() }
+                        if (System.currentTimeMillis() - ls > 20000) { saveState(); ls = System.currentTimeMillis(); notifyProgress("Analyse ${hms(t)} / ${hms(dur)}") }
                         ui("Analyse ${hms(t)} / ${hms(dur)} · ${items.size} changements")
                     }
                     r.release(); saveState()
@@ -321,6 +384,7 @@ class MainActivity : Activity() {
                 ui("Erreur : ${e.message ?: e}. La progression est gardée : relance pour reprendre.")
             } finally {
                 running = false
+                stopService(Intent(this, KeepAliveService::class.java))
                 runOnUiThread { goB.isEnabled = true; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
             }
         }.start()
@@ -337,22 +401,24 @@ class MainActivity : Activity() {
             for (c in todo()) {
                 if (stop) return
                 memo[c.zh] = Tasks.await(tr.translate(c.zh))
-                if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); saveState() }
+                if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState() }
             }
             return
         }
         while (!stop) {
-            val b = todo().take(25); if (b.isEmpty()) break
+            val gem = key.startsWith("AIza")
+            val b = todo().take(if (gem) 40 else 25); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
-            val res = claude(key, ctx, b)
+            val res = if (gem) gemini(key, ctx, b) else claude(key, ctx, b)
             b.forEachIndexed { j, c -> memo[c.zh] = res[j] }
             ui("Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size}")
+            notifyProgress("Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size}")
             saveState()
         }
     }
 
-    private fun claude(key: String, ctx: List<Cue>, b: List<Cue>): List<String> {
+    private fun prompt(ctx: List<Cue>, b: List<Cue>): String {
         val p = StringBuilder()
         p.append("Tu traduis les sous-titres d’un manhua raconté (chinois) en arabe standard moderne, naturel et fidèle. ")
         p.append("Garde la logique et la continuité du discours : résous les sujets et pronoms omis d’après le contexte, ")
@@ -366,30 +432,65 @@ class MainActivity : Activity() {
         p.append("Lignes à traduire (tableau JSON) :\n").append(JSONArray(b.map { it.zh })).append("\n\n")
         p.append("Réponds uniquement par un objet JSON {\"t\":[${b.size} chaînes arabes dans le même ordre],\"g\":{\"nom chinois\":\"nom arabe\"}} ; ")
         p.append("g ne contient que les NOUVEAUX noms propres ou termes clés.")
+        return p.toString()
+    }
+
+    private fun parse(out: String, n: Int): List<String> {
+        val j = JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1))
+        val arr = j.getJSONArray("t")
+        if (arr.length() != n) throw Exception("nombre de lignes différent")
+        j.optJSONObject("g")?.let { g -> g.keys().forEach { glossary[it] = g.getString(it) } }
+        while (glossary.size > 80) glossary.remove(glossary.keys.first())
+        return List(arr.length()) { arr.getString(it) }
+    }
+
+    private fun post(url: String, headers: Map<String, String>, body: JSONObject): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 30000; c.readTimeout = 120000
+        c.setRequestProperty("content-type", "application/json")
+        for ((k, v) in headers) c.setRequestProperty(k, v)
+        c.outputStream.use { it.write(body.toString().toByteArray()) }
+        val code = c.responseCode
+        val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
+        if (code >= 400) throw ApiErr(code)
+        return txt
+    }
+
+    private fun claude(key: String, ctx: List<Cue>, b: List<Cue>): List<String> {
         val body = JSONObject().put("model", "claude-sonnet-5-5").put("max_tokens", 4096)
-            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", p.toString())))
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt(ctx, b))))
         var err: Exception? = null
         for (a in 1..3) {
             try {
-                val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
-                c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 30000; c.readTimeout = 120000
-                c.setRequestProperty("x-api-key", key)
-                c.setRequestProperty("anthropic-version", "2023-06-01")
-                c.setRequestProperty("content-type", "application/json")
-                c.outputStream.use { it.write(body.toString().toByteArray()) }
-                val code = c.responseCode
-                val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
-                if (code >= 400) throw Exception("API $code")
-                val out = JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text")
-                val j = JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1))
-                val arr = j.getJSONArray("t")
-                if (arr.length() != b.size) throw Exception("nombre de lignes différent")
-                j.optJSONObject("g")?.let { g -> g.keys().forEach { glossary[it] = g.getString(it) } }
-                while (glossary.size > 80) glossary.remove(glossary.keys.first())
-                return List(arr.length()) { arr.getString(it) }
+                val txt = post("https://api.anthropic.com/v1/messages", mapOf("x-api-key" to key, "anthropic-version" to "2023-06-01"), body)
+                return parse(JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text"), b.size)
             } catch (e: Exception) { err = e; Thread.sleep(4000L * a) }
         }
         throw err!!
+    }
+
+    private fun gemini(key: String, ctx: List<Cue>, b: List<Cue>): List<String> {
+        val body = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt(ctx, b))))))
+            .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0.3))
+        var err: Exception? = null
+        for (a in 1..4) {
+            try {
+                val model = if (a >= 3) "gemini-flash-lite-latest" else "gemini-flash-latest"
+                val txt = post("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent", mapOf("x-goog-api-key" to key), body)
+                val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                val r = parse(out, b.size)
+                Thread.sleep(5000)
+                return r
+            } catch (e: Exception) {
+                err = e
+                Thread.sleep(if (e is ApiErr && e.code == 429) 25000L else 4000L * a)
+            }
+        }
+        val e = err
+        if (e is ApiErr && e.code == 429) throw Exception("Quota gratuit Gemini atteint (par minute ou par jour) : attends un peu ou reviens demain")
+        throw e!!
     }
 
     private fun ts(t: Double): String {
