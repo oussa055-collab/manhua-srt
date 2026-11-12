@@ -50,7 +50,7 @@ import kotlin.math.abs
 
 class Cue(var start: Double, var end: Double, var zh: String, var ar: String = "")
 
-class ApiErr(val code: Int) : Exception("API $code")
+class ApiErr(val code: Int, body: String = "") : Exception("API $code " + body.replace(Regex("\\s+"), " ").take(160))
 
 fun ensureChannel(c: Context) {
     c.getSystemService(NotificationManager::class.java)
@@ -141,7 +141,7 @@ class MainActivity : Activity() {
         sTop = bar(95, 80); sBot = bar(100, 98)
         col.addView(sTop); col.addView(sBot)
         key = EditText(this).apply {
-            hint = "Clé API : Gemini gratuite (AIza…) ou Claude. Vide = hors ligne"
+            hint = "Clé API : Gemini gratuite (AQ… ou AIza…) ou Claude (sk-…). Vide = hors ligne"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setText(getSharedPreferences("p", 0).getString("k", ""))
         }
@@ -406,7 +406,7 @@ class MainActivity : Activity() {
             return
         }
         while (!stop) {
-            val gem = key.startsWith("AIza")
+            val gem = !key.startsWith("sk-")
             val b = todo().take(if (gem) 40 else 25); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
@@ -452,7 +452,7 @@ class MainActivity : Activity() {
         c.outputStream.use { it.write(body.toString().toByteArray()) }
         val code = c.responseCode
         val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
-        if (code >= 400) throw ApiErr(code)
+        if (code >= 400) throw ApiErr(code, txt)
         return txt
     }
 
@@ -484,6 +484,7 @@ class MainActivity : Activity() {
                 Thread.sleep(5000)
                 return r
             } catch (e: Exception) {
+                if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
                 Thread.sleep(if (e is ApiErr && e.code == 429) 25000L else 4000L * a)
             }
