@@ -107,6 +107,16 @@ class MainActivity : Activity() {
     @Volatile private var fellBack = false
     @Volatile private var failNotes = ""
     private val offlineKeys = HashSet<String>()
+    private val srcMap = HashMap<String, String>()
+    private val pstate = LinkedHashMap<String, String>()
+    private val pquota = LinkedHashMap<String, String>()
+    @Volatile private var activeName = ""
+    @Volatile private var firstName = "Gemini"
+    @Volatile private var srtMode = false
+    private var srtKey = ""
+    @Volatile private var srcLang = "chinois"
+    @Volatile private var srcIsEn = false
+    private lateinit var panel: TextView
     private var rEnd = 0.0
     @Volatile private var stop = false
     @Volatile private var running = false
@@ -181,8 +191,12 @@ class MainActivity : Activity() {
         goB = btn("2. Analyser et traduire") { start() }.also { it.isEnabled = false }
         col.addView(goB)
         col.addView(btn("Arrêter (la progression est gardée)") { stop = true })
+        panel = TextView(this).apply { setTextColor(0xFF1B7F3A.toInt()); textSize = 14f; setPadding(0, dp(10), 0, dp(10)) }
+        col.addView(panel)
+        col.addView(btn("Vérifier mes quotas (Gemini, Groq, OpenRouter)") { checkQuotas() })
         playB = btn("3. Lire avec sous-titres") { play() }.also { it.isEnabled = false }
         col.addView(playB)
+        col.addView(btn("Traduire un fichier .srt (chinois ou anglais → arabe)") { if (!running) pickSrt() })
         col.addView(btn("Mon glossaire (noms et termes)") { editGlossary() })
         col.addView(btn("Retraduire avec le glossaire (garde l’analyse)") {
             if (!running && uri != null) confirmDanger(
@@ -191,7 +205,7 @@ class MainActivity : Activity() {
                 null
             ) {
                 backupState()
-                memo.clear(); offlineKeys.clear(); saveState(); playB.isEnabled = false
+                memo.clear(); offlineKeys.clear(); srcMap.clear(); saveState(); playB.isEnabled = false
                 st.text = "Traductions effacées. Appuie sur « 2 » pour retraduire avec ton glossaire."
             }
         })
@@ -203,7 +217,7 @@ class MainActivity : Activity() {
             ) {
                 backupState()
                 val n = offlineKeys.size
-                offlineKeys.forEach { memo.remove(it) }; offlineKeys.clear(); saveState(); playB.isEnabled = false
+                offlineKeys.forEach { memo.remove(it); srcMap.remove(it) }; offlineKeys.clear(); saveState(); playB.isEnabled = false
                 st.text = "$n lignes hors ligne effacées. Appuie sur « 2 » pour les retraduire avec tes serveurs."
             }
         })
@@ -221,7 +235,7 @@ class MainActivity : Activity() {
                 "EFFACER"
             ) {
                 backupState()
-                items.clear(); memo.clear(); offlineKeys.clear(); done = 0.0; cues = listOf()
+                items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); done = 0.0; cues = listOf()
                 sf().delete()
                 playB.isEnabled = false
                 st.text = "Progression effacée. Une copie de secours existe : « Restaurer »."
@@ -245,6 +259,7 @@ class MainActivity : Activity() {
             addView(ScrollView(this@MainActivity).apply { addView(col) })
             addView(box)
         })
+        renderPanel()
     }
 
     private fun bak() = File(filesDir, "bak_" + sf().name)
@@ -286,11 +301,12 @@ class MainActivity : Activity() {
         } catch (e: Exception) {}
     }
 
-    @Synchronized private fun saveGl() {
-        try {
+    @Synchronized private fun saveGl(): Boolean {
+        return try {
             File(filesDir, "glossaire.json").writeText(
                 JSONObject().put("user", JSONObject(userGl.toMap())).put("learned", JSONObject(glossary.toMap())).toString())
-        } catch (e: Exception) {}
+            true
+        } catch (e: Exception) { false }
     }
 
     private fun editGlossary() {
@@ -299,20 +315,35 @@ class MainActivity : Activity() {
             setText(all.entries.joinToString("\n") { "${it.key} = ${it.value}" })
             minLines = 8; gravity = Gravity.TOP
         }
+        val original = et.text.toString()
+        fun save() {
+            val nu = LinkedHashMap<String, String>(); var ignored = 0
+            val sep = Regex("\\s*(.+?)\\s*(?:=|＝|→|->|：|:|\\t)\\s*(.+)")
+            for (l in et.text.toString().lines()) {
+                if (l.isBlank()) continue
+                val m = sep.matchEntire(l.trim())
+                if (m == null) { ignored++; continue }
+                nu[m.groupValues[1].trim()] = m.groupValues[2].trim()
+            }
+            userGl.clear(); userGl.putAll(nu); glossary.clear()
+            val ok = saveGl()
+            st.text = (if (ok) "Glossaire enregistré : ${nu.size} termes" else "ÉCHEC de l’enregistrement du glossaire") +
+                (if (ignored > 0) " ($ignored lignes ignorées : écris « chinois = arabe »)." else ".")
+        }
         AlertDialog.Builder(this).setTitle("Mon glossaire : chinois = arabe")
-            .setMessage("Une ligne par terme. Ces traductions passent avant tout le reste, en ligne et hors ligne.")
+            .setMessage("Une ligne par terme, avec « = » entre les deux. Appuie sur Enregistrer pour garder tes modifications.")
             .setView(ScrollView(this).apply { addView(et) })
-            .setPositiveButton("Enregistrer") { _, _ ->
-                userGl.clear(); glossary.clear()
-                et.text.toString().lines().forEach { l ->
-                    val i = l.indexOf('=')
-                    if (i > 0) {
-                        val k = l.substring(0, i).trim(); val v = l.substring(i + 1).trim()
-                        if (k.isNotEmpty() && v.isNotEmpty()) userGl[k] = v
-                    }
+            .setCancelable(false)
+            .setPositiveButton("Enregistrer") { _, _ -> save() }
+            .setNegativeButton("Fermer") { _, _ ->
+                if (et.text.toString() != original) {
+                    AlertDialog.Builder(this).setTitle("Modifications non enregistrées")
+                        .setMessage("Les enregistrer avant de fermer ?")
+                        .setCancelable(false)
+                        .setPositiveButton("Enregistrer") { _, _ -> save() }
+                        .setNegativeButton("Perdre", null).show()
                 }
-                saveGl()
-            }.setNegativeButton("Annuler", null).show()
+            }.show()
     }
 
     private fun offlineLine(tr: Translator, zh: String): String {
@@ -364,6 +395,11 @@ class MainActivity : Activity() {
             }
             return
         }
+        if (rq == 4) {
+            val su = d?.data
+            if (rc == RESULT_OK && su != null) translateSrtFile(su)
+            return
+        }
         val u = d?.data ?: return
         if (rc != RESULT_OK) return
         try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
@@ -382,7 +418,7 @@ class MainActivity : Activity() {
                 try { loadState() } catch (e: Exception) { items.clear(); memo.clear(); done = 0.0 }
                 runOnUiThread {
                     if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText((savedStart / 60).toString()) }
-                    drawPreview(); goB.isEnabled = true
+                    drawPreview(); renderPanel(); goB.isEnabled = true
                     playB.isEnabled = cues.isNotEmpty() && cues.all { it.ar.isNotEmpty() }
                     st.text = "Durée ${hms(durMs / 1000.0)}." + if (items.isNotEmpty()) " Progression retrouvée : ${hms(done)}." else " Ajuste la zone rouge puis lance l’analyse."
                 }
@@ -406,15 +442,22 @@ class MainActivity : Activity() {
     }
 
     @Synchronized private fun saveState() {
+        if (srtMode) {
+            try {
+                File(filesDir, "srt_$srtKey.json").writeText(JSONObject().put("memo", JSONObject(memo.toMap()))
+                    .put("src", JSONObject(srcMap.toMap())).put("off", JSONArray(offlineKeys.toList())).toString())
+            } catch (e: Exception) {}
+            saveGl(); return
+        }
         val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot).put("rs", savedStart)
         o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
-        o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList()))
+        o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList())).put("src", JSONObject(srcMap.toMap()))
         sf().writeText(o.toString())
         saveGl()
     }
 
     private fun loadState() {
-        items.clear(); memo.clear(); offlineKeys.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
+        items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
         val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
         done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
@@ -422,6 +465,7 @@ class MainActivity : Activity() {
         for (i in 0 until a.length()) { val x = a.getJSONArray(i); items.add(x.getDouble(0) to x.getString(1)) }
         val m = o.getJSONObject("memo"); m.keys().forEach { memo[it] = m.getString(it) }
         offlineKeys.clear(); o.optJSONArray("off")?.let { a -> for (i in 0 until a.length()) offlineKeys.add(a.getString(i)) }
+        o.optJSONObject("src")?.let { s2 -> s2.keys().forEach { srcMap[it] = s2.getString(it) } }
         if (items.isNotEmpty()) { cues = buildCues(); cues.forEach { it.ar = memo[it.zh] ?: "" } }
     }
 
@@ -545,36 +589,84 @@ class MainActivity : Activity() {
 
     private fun offlineTranslate(list: List<Cue>) {
         val tr = Translation.getClient(TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
+            .setSourceLanguage(if (srcIsEn) TranslateLanguage.ENGLISH else TranslateLanguage.CHINESE)
+            .setTargetLanguage(TranslateLanguage.ARABIC).build())
+        activeName = "Hors ligne"; pst("Hors ligne", "ACTIF — préparation du modèle local…")
         ui("Téléchargement du modèle hors ligne (une seule fois)…")
         Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+        pst("Hors ligne", "ACTIF — traduction locale")
         var n = 0
         for (c in list) {
             if (stop) return
             if (memo[c.zh] != null) continue
-            memo[c.zh] = offlineLine(tr, c.zh); offlineKeys.add(c.zh)
-            if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState() }
+            memo[c.zh] = offlineLine(tr, c.zh); offlineKeys.add(c.zh); srcMap[c.zh] = "H"
+            if (++n % 25 == 0) {
+                ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState()
+                pst("Hors ligne", "ACTIF — $n lignes ce passage")
+            }
         }
+        pst("Hors ligne", "terminé — $n lignes ce passage"); activeName = ""
     }
 
-    private fun online(): Boolean {
+    private fun online(): Boolean = try {
         val cm = getSystemService(ConnectivityManager::class.java)
-        val c = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
-        return c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-    }
+        val c = cm.getNetworkCapabilities(cm.activeNetwork)
+        c != null && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    } catch (e: Exception) { true }
 
     private fun prepareOffline() {
         try {
             val tr = Translation.getClient(TranslatorOptions.Builder()
-                .setSourceLanguage(TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
+                .setSourceLanguage(if (srcIsEn) TranslateLanguage.ENGLISH else TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
             Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
             tr.close()
         } catch (e: Exception) {}
     }
 
+    private fun codeOf(n: String) = when (n) { "Gemini" -> "G"; "Groq" -> "Q"; "OpenRouter" -> "O"; "Claude" -> "C"; else -> "H" }
+
+    private fun pst(n: String, t: String) {
+        synchronized(pstate) { pstate[n] = t }
+        runOnUiThread { renderPanel() }
+    }
+
+    private fun renderPanel() {
+        val names = listOf(firstName, "Groq", "OpenRouter", "Hors ligne")
+        val total = cues.count { memo[it.zh] != null }
+        val sb = StringBuilder()
+        sb.append("Serveur actif : ").append(if (activeName.isEmpty()) "aucun" else activeName)
+            .append(" · Internet : ").append(if (online()) "oui" else "non")
+            .append("\nTotal traduit : ").append(total).append(" / ").append(cues.size).append("\n")
+        var known = 0
+        for (n in names) {
+            val code = codeOf(n)
+            val cnt = cues.count { srcMap[it.zh] == code }
+            known += cnt
+            val s = synchronized(pstate) { pstate[n] ?: "en attente" }
+            sb.append(if (n == activeName) "▶ " else "• ").append(n).append(" — ").append(s).append(" — ").append(cnt).append(" lignes\n")
+            val q = synchronized(pquota) { pquota[n] }
+            val ql = if (n == "Hors ligne") "illimité (sur ton téléphone)"
+                else "demandes envoyées aujourd’hui : " + usedToday(n) +
+                    (if (q != null) " · $q" else if (n == "Gemini") " · reste exact : AI Studio > Usage (non fourni par l’API)" else "")
+            sb.append("     ").append(ql).append("\n")
+        }
+        if (total > known) sb.append("• Avant cette version : ").append(total - known).append(" lignes\n")
+        panel.text = sb.toString().trimEnd()
+    }
+
     private fun translateAll(k1: String, k2: String, k3: String) {
         fellBack = false
         failNotes = ""
+        activeName = ""
+        firstName = if (k1.startsWith("sk-ant")) "Claude" else "Gemini"
+        synchronized(pstate) {
+            pstate.clear()
+            pstate[firstName] = if (k1.isEmpty()) "pas de clé" else "en attente"
+            pstate["Groq"] = if (k2.isEmpty()) "pas de clé" else "en attente"
+            pstate["OpenRouter"] = if (k3.isEmpty()) "pas de clé" else "en attente"
+            pstate["Hors ligne"] = "prêt"
+        }
+        runOnUiThread { renderPanel() }
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
         val chain = mutableListOf<Prov>()
@@ -582,10 +674,10 @@ class MainActivity : Activity() {
         if (k1.startsWith("sk-ant")) chain.add(Prov("Claude", 25, 0L) { c, b -> claude(k1, c, b) })
         else if (k1.isNotEmpty()) chain.add(Prov("Gemini", 40, 0L) { c, b -> gemini(k1, c, b, if (nKeys > 1) 4 else 12) })
         if (k2.isNotEmpty()) chain.add(Prov("Groq", 25, 2500L) { c, b ->
-            oai("https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "gpt-oss-120b", "qwen"), false, c, b)
+            oai("Groq", "https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "gpt-oss-120b", "qwen"), false, c, b)
         })
         if (k3.isNotEmpty()) chain.add(Prov("OpenRouter", 20, 4000L) { c, b ->
-            oai("https://openrouter.ai/api/v1", k3, listOf("qwen", "llama-3.3-70b", "gpt-oss-120b", "gemma"), true, c, b)
+            oai("OpenRouter", "https://openrouter.ai/api/v1", k3, listOf("qwen", "llama-3.3-70b", "gpt-oss-120b", "gemma"), true, c, b)
         })
         if (chain.isEmpty()) { offlineTranslate(todo()); return }
         if (!online()) {
@@ -596,6 +688,7 @@ class MainActivity : Activity() {
         }
         ui("Préparation du mode hors ligne (une seule fois)…")
         prepareOffline()
+        if (k3.isNotEmpty()) refreshOrQuota(k3)
         val dead = HashSet<String>()
         while (!stop) {
             if (!online()) {
@@ -611,20 +704,102 @@ class MainActivity : Activity() {
             val b = todo().take(prov.batch); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
+            activeName = prov.name
+            pst(prov.name, "ACTIF — traduit un lot de ${b.size} lignes…")
             try {
                 val res = prov.call(ctx, b)
-                b.forEachIndexed { j, c -> memo[c.zh] = res[j]; offlineKeys.remove(c.zh) }
+                b.forEachIndexed { j, c -> memo[c.zh] = res[j]; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name) }
                 val msg = "Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size} (${prov.name})"
                 ui(msg); notifyProgress(msg); saveState()
+                pst(prov.name, "ACTIF ✓ dernier lot : ${b.size} lignes")
+                if (prov.name == "OpenRouter") refreshOrQuota(k3)
                 if (prov.pause > 0) Thread.sleep(prov.pause)
             } catch (e: Exception) {
                 if (stop) return
                 dead.add(prov.name)
-                failNotes += prov.name + " (" + (if (e is ApiErr) e.code.toString() else "erreur") + ") "
-                ui(prov.name + " indisponible (" + (if (e is ApiErr) e.code.toString() else "erreur") + ") : serveur suivant…")
+                val code = if (e is ApiErr) e.code.toString() else "erreur"
+                failNotes += prov.name + " (" + code + ") "
+                pst(prov.name, "en échec ($code) : mis de côté")
+                activeName = ""
+                ui(prov.name + " indisponible (" + code + ") : serveur suivant…")
                 Thread.sleep(1500)
             }
         }
+        activeName = ""
+        chain.forEach { if (it.name !in dead) pst(it.name, "terminé") }
+    }
+
+    private fun provOf(url: String) = when {
+        url.contains("generativelanguage") -> "Gemini"
+        url.contains("groq") -> "Groq"
+        url.contains("openrouter") -> "OpenRouter"
+        else -> "Claude"
+    }
+
+    private fun today(): String = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+
+    private fun usedToday(n: String): Int {
+        val sp = getSharedPreferences("p", 0)
+        return if (sp.getString("d_$n", "") == today()) sp.getInt("n_$n", 0) else 0
+    }
+
+    private fun countReq(n: String) {
+        val sp = getSharedPreferences("p", 0)
+        sp.edit().putString("d_$n", today()).putInt("n_$n", usedToday(n) + 1).apply()
+    }
+
+    private fun quotaFrom(url: String, c: HttpURLConnection) {
+        val n = provOf(url)
+        countReq(n)
+        if (n == "Groq") {
+            val rr = c.getHeaderField("x-ratelimit-remaining-requests"); val rl = c.getHeaderField("x-ratelimit-limit-requests")
+            val tr = c.getHeaderField("x-ratelimit-remaining-tokens"); val tl = c.getHeaderField("x-ratelimit-limit-tokens")
+            val rs = c.getHeaderField("x-ratelimit-reset-requests")
+            if (rr != null) synchronized(pquota) {
+                pquota["Groq"] = "reste : $rr / $rl demandes aujourd’hui (renouvelé dans $rs) · jetons cette minute : $tr / $tl"
+            }
+        }
+        runOnUiThread { renderPanel() }
+    }
+
+    private fun refreshOrQuota(key: String) {
+        try {
+            val c = URL("https://openrouter.ai/api/v1/key").openConnection() as HttpURLConnection
+            c.setRequestProperty("Authorization", "Bearer $key"); c.connectTimeout = 15000; c.readTimeout = 20000
+            val code = c.responseCode
+            val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
+            val t: String
+            if (code >= 400) t = "clé refusée ($code)"
+            else {
+                val d = JSONObject(txt).getJSONObject("data")
+                val parts = mutableListOf<String>()
+                val f = d.opt("free_model_daily_requests")
+                if (f != null && f != JSONObject.NULL) parts.add("gratuit par jour : " + f.toString().replace("\"", "").take(80))
+                if (d.has("is_free_tier")) parts.add(if (d.optBoolean("is_free_tier")) "offre gratuite (limite indicative : 50 demandes/jour)" else "compte avec crédits")
+                t = if (parts.isEmpty()) "clé valide" else parts.joinToString(" · ")
+            }
+            synchronized(pquota) { pquota["OpenRouter"] = t }
+            runOnUiThread { renderPanel() }
+        } catch (e: Exception) {}
+    }
+
+    private fun checkQuotas() {
+        val k1 = key.text.toString().trim(); val k2 = key2.text.toString().trim(); val k3 = key3.text.toString().trim()
+        ui("Vérification des quotas…")
+        Thread {
+            try {
+                if (k3.isNotEmpty()) refreshOrQuota(k3)
+                if (k2.isNotEmpty()) {
+                    val base = "https://api.groq.com/openai/v1"
+                    val model = pickModel(base, k2, listOf("llama-3.3-70b", "llama-4", "gpt-oss-120b", "qwen"), false)
+                    val body = JSONObject().put("model", model).put("max_tokens", 1)
+                        .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "ok")))
+                    try { post("$base/chat/completions", mapOf("Authorization" to "Bearer $k2"), body) } catch (e: ApiErr) {}
+                }
+                ui("Quotas mis à jour (voir le panneau vert).")
+            } catch (e: Exception) { ui("Vérification impossible : ${e.message ?: e}") }
+            runOnUiThread { renderPanel() }
+        }.start()
     }
 
     private val modelCache = HashMap<String, String>()
@@ -647,7 +822,7 @@ class MainActivity : Activity() {
         return m
     }
 
-    private fun oai(base: String, key: String, prefs: List<String>, freeOnly: Boolean, ctx: List<Cue>, b: List<Cue>): List<String> {
+    private fun oai(name: String, base: String, key: String, prefs: List<String>, freeOnly: Boolean, ctx: List<Cue>, b: List<Cue>): List<String> {
         var err: Exception? = null
         for (a in 1..3) {
             var model = ""
@@ -665,6 +840,7 @@ class MainActivity : Activity() {
                 if (e !is ApiErr && !online()) throw e
                 if (e is ApiErr && e.code == 429 && a >= 2) break
                 val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 20L * a else 3L * a
+                pst(name, "occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s")
                 ui("Serveur occupé : nouvel essai dans $wait s…")
                 Thread.sleep(wait * 1000)
             }
@@ -678,7 +854,7 @@ class MainActivity : Activity() {
         for ((k, v) in glossary) if (src.contains(k)) rel[k] = v
         for ((k, v) in userGl) if (src.contains(k)) rel[k] = v
         val p = StringBuilder()
-        p.append("Tu traduis les sous-titres d’un manhua raconté (chinois) en arabe standard moderne, naturel et fidèle. ")
+        p.append("Tu traduis les sous-titres d’un manhua raconté ($srcLang) en arabe standard moderne, naturel et fidèle. ")
         p.append("Garde la logique et la continuité du discours : résous les sujets et pronoms omis d’après le contexte, ")
         p.append("garde les mêmes termes et la même transcription des noms propres (glossaire), le même ton et le même registre. ")
         p.append("Ne résume pas, ne commente pas.\n\nGlossaire à respecter exactement : ").append(JSONObject(rel.toMap())).append("\n\n")
@@ -710,6 +886,7 @@ class MainActivity : Activity() {
         for ((k, v) in headers) c.setRequestProperty(k, v)
         c.outputStream.use { it.write(body.toString().toByteArray()) }
         val code = c.responseCode
+        quotaFrom(url, c)
         val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
         if (code >= 400) throw ApiErr(code, txt)
         return txt
@@ -749,10 +926,108 @@ class MainActivity : Activity() {
                 if (e !is ApiErr && !online()) throw e
                 val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) minOf(300L, 20L * a) else 4L * a
                 ui("Gemini occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s…")
+                pst("Gemini", "occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s")
                 Thread.sleep(wait * 1000)
             }
         }
         throw err!!
+    }
+
+    private fun pickSrt() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE), 4)
+    }
+
+    private fun nameOf(u: Uri): String = try {
+        contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        } ?: "fichier.srt"
+    } catch (e: Exception) { "fichier.srt" }
+
+    private fun parseSrt(t: String): List<Cue> {
+        val out = mutableListOf<Cue>()
+        val tm = Regex("(\\d+):(\\d+):(\\d+)[,.](\\d+)\\s*-->\\s*(\\d+):(\\d+):(\\d+)[,.](\\d+)")
+        fun sec(h: String, m: String, s: String, ms: String) =
+            h.toInt() * 3600 + m.toInt() * 60 + s.toInt() + ms.padEnd(3, '0').take(3).toInt() / 1000.0
+        for (blk in t.replace("\r", "").split(Regex("\n\\s*\n"))) {
+            val lines = blk.trim().split("\n")
+            val ti = lines.indexOfFirst { tm.containsMatchIn(it) }
+            if (ti < 0) continue
+            val m = tm.find(lines[ti])!!.groupValues
+            val txt = lines.drop(ti + 1).joinToString(" ")
+                .replace(Regex("<[^>]+>|\\{\\\\[^}]*\\}"), "").replace(Regex("\\s+"), " ").trim()
+            if (txt.isEmpty()) continue
+            out.add(Cue(sec(m[1], m[2], m[3], m[4]), sec(m[5], m[6], m[7], m[8]), txt))
+        }
+        return out
+    }
+
+    private fun loadSrtState() {
+        try {
+            val f = File(filesDir, "srt_$srtKey.json"); if (!f.exists()) return
+            val o = JSONObject(f.readText())
+            val m = o.getJSONObject("memo"); m.keys().forEach { memo[it] = m.getString(it) }
+            o.optJSONObject("src")?.let { s2 -> s2.keys().forEach { srcMap[it] = s2.getString(it) } }
+            o.optJSONArray("off")?.let { a -> for (i in 0 until a.length()) offlineKeys.add(a.getString(i)) }
+        } catch (e: Exception) {}
+    }
+
+    private fun outFile(name: String, text: String): Boolean {
+        val tree = getSharedPreferences("p", 0).getString("tree", null)?.let { Uri.parse(it) }
+        if (tree != null) { try { putTree(tree, name, text); return true } catch (e: Exception) {} }
+        val v = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, "application/x-subrip")
+        }
+        val u = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
+        contentResolver.openOutputStream(u)!!.use { it.write(("\uFEFF" + text).toByteArray()) }
+        return false
+    }
+
+    private fun translateSrtFile(u: Uri) {
+        if (running) return
+        val k = key.text.toString().trim(); val k2 = key2.text.toString().trim(); val k3 = key3.text.toString().trim()
+        getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply()
+        val name = nameOf(u)
+        val outBase = name.substringBeforeLast('.')
+        running = true; stop = false; srtMode = true; goB.isEnabled = false
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        ensureChannel(this)
+        startForegroundService(Intent(this, KeepAliveService::class.java))
+        askBackground()
+        Thread {
+            try {
+                val raw = contentResolver.openInputStream(u)!!.use { it.readBytes() }.toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                val blocks = parseSrt(raw)
+                if (blocks.isEmpty()) { ui("Fichier .srt vide ou illisible."); return@Thread }
+                val sample = blocks.joinToString(" ") { it.zh }
+                val cjk = Regex("[\\u4e00-\\u9fff]").findAll(sample).count()
+                val lat = Regex("[A-Za-z]").findAll(sample).count()
+                srcIsEn = lat > cjk; srcLang = if (srcIsEn) "anglais" else "chinois"
+                cues = blocks; memo.clear(); offlineKeys.clear(); srcMap.clear()
+                srtKey = abs(u.toString().hashCode()).toString()
+                loadSrtState()
+                ui("Fichier lu : ${cues.size} sous-titres ($srcLang → arabe). Traduction…")
+                translateAll(k, k2, k3)
+                if (stop) { saveState(); ui("Arrêté. Relance le même fichier pour reprendre."); return@Thread }
+                cues.forEach { it.ar = memo[it.zh] ?: "" }
+                val inTree = outFile("$outBase.ar.srt", srt { it.ar })
+                File(filesDir, "srt_$srtKey.json").delete()
+                ui("SRT traduit ✓ ${cues.size} sous-titres ($srcLang → arabe). Fichier : $outBase.ar.srt " +
+                    (if (inTree) "dans le dossier de sortie choisi." else "dans Téléchargements."))
+            } catch (e: Exception) {
+                try { saveState() } catch (x: Exception) {}
+                ui("Erreur : ${e.message ?: e}. Progression gardée : relance le même fichier.")
+            } finally {
+                srtMode = false; srcIsEn = false; srcLang = "chinois"; running = false
+                stopService(Intent(this, KeepAliveService::class.java))
+                runOnUiThread {
+                    goB.isEnabled = true; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    if (uri != null) { try { loadState() } catch (e: Exception) {} }
+                    else { cues = listOf(); memo.clear(); srcMap.clear(); offlineKeys.clear() }
+                    renderPanel()
+                }
+            }
+        }.start()
     }
 
     private fun ts(t: Double): String {
