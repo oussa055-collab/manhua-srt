@@ -105,6 +105,8 @@ class MainActivity : Activity() {
     private var savedBot = 98
     private var savedStart = 0.0
     @Volatile private var fellBack = false
+    @Volatile private var failNotes = ""
+    private val offlineKeys = HashSet<String>()
     private var rEnd = 0.0
     @Volatile private var stop = false
     @Volatile private var running = false
@@ -183,18 +185,48 @@ class MainActivity : Activity() {
         col.addView(playB)
         col.addView(btn("Mon glossaire (noms et termes)") { editGlossary() })
         col.addView(btn("Retraduire avec le glossaire (garde l’analyse)") {
-            if (!running && uri != null) {
-                memo.clear(); saveState(); playB.isEnabled = false
+            if (!running && uri != null) confirmDanger(
+                "Retraduire toute la vidéo ?",
+                "Les ${memo.size} traductions actuelles seront effacées (l’analyse est gardée). Une copie de secours est conservée : « Restaurer » les remet.",
+                null
+            ) {
+                backupState()
+                memo.clear(); offlineKeys.clear(); saveState(); playB.isEnabled = false
                 st.text = "Traductions effacées. Appuie sur « 2 » pour retraduire avec ton glossaire."
             }
         })
-        col.addView(btn("Effacer la progression") {
-            if (!running) {
-                items.clear(); memo.clear(); done = 0.0; cues = listOf()
-                uri?.let { sf().delete() }
-                playB.isEnabled = false; st.text = "Progression effacée."
+        col.addView(btn("Retraduire seulement la partie hors ligne") {
+            if (!running && uri != null) confirmDanger(
+                "Retraduire la partie hors ligne ?",
+                "${offlineKeys.size} lignes traduites hors ligne seront effacées pour être retraduites par tes serveurs. Les autres sont gardées.",
+                null
+            ) {
+                backupState()
+                val n = offlineKeys.size
+                offlineKeys.forEach { memo.remove(it) }; offlineKeys.clear(); saveState(); playB.isEnabled = false
+                st.text = "$n lignes hors ligne effacées. Appuie sur « 2 » pour les retraduire avec tes serveurs."
             }
         })
+        col.addView(btn("Restaurer la dernière progression effacée") {
+            if (!running && uri != null) confirmDanger(
+                "Restaurer la sauvegarde ?",
+                "La progression actuelle sera remplacée par la dernière copie de secours.",
+                null
+            ) { restoreState() }
+        })
+        col.addView(btn("⚠ Effacer la progression") {
+            if (!running && uri != null) confirmDanger(
+                "Effacer TOUTE la progression ?",
+                "Tu vas perdre l’analyse jusqu’à ${hms(done)} et ${memo.size} lignes traduites pour cette vidéo. Une copie de secours est gardée : « Restaurer » la remet.",
+                "EFFACER"
+            ) {
+                backupState()
+                items.clear(); memo.clear(); offlineKeys.clear(); done = 0.0; cues = listOf()
+                sf().delete()
+                playB.isEnabled = false
+                st.text = "Progression effacée. Une copie de secours existe : « Restaurer »."
+            }
+        }.also { it.setTextColor(Color.RED) })
         st = TextView(this).apply { setPadding(0, dp(12), 0, 0) }
         col.addView(st)
 
@@ -213,6 +245,36 @@ class MainActivity : Activity() {
             addView(ScrollView(this@MainActivity).apply { addView(col) })
             addView(box)
         })
+    }
+
+    private fun bak() = File(filesDir, "bak_" + sf().name)
+
+    private fun backupState() {
+        try { if (sf().exists()) sf().copyTo(bak(), overwrite = true) } catch (e: Exception) {}
+    }
+
+    private fun restoreState() {
+        val b = bak()
+        if (!b.exists()) { st.text = "Aucune sauvegarde à restaurer."; return }
+        try {
+            b.copyTo(sf(), overwrite = true)
+            loadState()
+            if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText((savedStart / 60).toString()) }
+            playB.isEnabled = cues.isNotEmpty() && cues.all { it.ar.isNotEmpty() }
+            st.text = "Progression restaurée : analyse ${hms(done)}, ${memo.size} lignes traduites."
+        } catch (e: Exception) { st.text = "Restauration impossible : ${e.message}" }
+    }
+
+    private fun confirmDanger(title: String, msg: String, word: String?, action: () -> Unit) {
+        val et = EditText(this).apply { hint = if (word != null) "Tape $word pour confirmer" else "" }
+        val b = AlertDialog.Builder(this).setTitle(title).setMessage(msg)
+        if (word != null) b.setView(et)
+        b.setNegativeButton("Annuler", null)
+        b.setPositiveButton("Confirmer") { _, _ ->
+            if (word == null || et.text.toString().trim().equals(word, true)) action()
+            else st.text = "Mot incorrect : rien n’a été effacé."
+        }
+        b.show()
     }
 
     private fun loadGl() {
@@ -346,19 +408,20 @@ class MainActivity : Activity() {
     @Synchronized private fun saveState() {
         val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot).put("rs", savedStart)
         o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
-        o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap()))
+        o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList()))
         sf().writeText(o.toString())
         saveGl()
     }
 
     private fun loadState() {
-        items.clear(); memo.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
+        items.clear(); memo.clear(); offlineKeys.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
         val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
         done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
         val a = o.getJSONArray("items")
         for (i in 0 until a.length()) { val x = a.getJSONArray(i); items.add(x.getDouble(0) to x.getString(1)) }
         val m = o.getJSONObject("memo"); m.keys().forEach { memo[it] = m.getString(it) }
+        offlineKeys.clear(); o.optJSONArray("off")?.let { a -> for (i in 0 until a.length()) offlineKeys.add(a.getString(i)) }
         if (items.isNotEmpty()) { cues = buildCues(); cues.forEach { it.ar = memo[it.zh] ?: "" } }
     }
 
@@ -467,7 +530,7 @@ class MainActivity : Activity() {
                 val inTree = exportAll()
                 val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
                 val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
-                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote" + if (fellBack) " Une partie a été traduite hors ligne (quota gratuit atteint)." else "")
+                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
                 try { saveState() } catch (x: Exception) {}
@@ -489,7 +552,7 @@ class MainActivity : Activity() {
         for (c in list) {
             if (stop) return
             if (memo[c.zh] != null) continue
-            memo[c.zh] = offlineLine(tr, c.zh)
+            memo[c.zh] = offlineLine(tr, c.zh); offlineKeys.add(c.zh)
             if (++n % 25 == 0) { ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState() }
         }
     }
@@ -511,6 +574,7 @@ class MainActivity : Activity() {
 
     private fun translateAll(k1: String, k2: String, k3: String) {
         fellBack = false
+        failNotes = ""
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
         val chain = mutableListOf<Prov>()
@@ -526,6 +590,7 @@ class MainActivity : Activity() {
         if (chain.isEmpty()) { offlineTranslate(todo()); return }
         if (!online()) {
             fellBack = true
+            failNotes = "pas d’internet"
             ui("Pas d’internet : traduction hors ligne directe…")
             offlineTranslate(todo()); return
         }
@@ -533,7 +598,10 @@ class MainActivity : Activity() {
         prepareOffline()
         val dead = HashSet<String>()
         while (!stop) {
-            if (!online()) dead.addAll(chain.map { it.name })
+            if (!online()) {
+                if (!failNotes.contains("internet")) failNotes += "internet coupé "
+                dead.addAll(chain.map { it.name })
+            }
             val prov = chain.firstOrNull { it.name !in dead }
             if (prov == null) {
                 fellBack = true
@@ -545,13 +613,14 @@ class MainActivity : Activity() {
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
             try {
                 val res = prov.call(ctx, b)
-                b.forEachIndexed { j, c -> memo[c.zh] = res[j] }
+                b.forEachIndexed { j, c -> memo[c.zh] = res[j]; offlineKeys.remove(c.zh) }
                 val msg = "Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size} (${prov.name})"
                 ui(msg); notifyProgress(msg); saveState()
                 if (prov.pause > 0) Thread.sleep(prov.pause)
             } catch (e: Exception) {
                 if (stop) return
                 dead.add(prov.name)
+                failNotes += prov.name + " (" + (if (e is ApiErr) e.code.toString() else "erreur") + ") "
                 ui(prov.name + " indisponible (" + (if (e is ApiErr) e.code.toString() else "erreur") + ") : serveur suivant…")
                 Thread.sleep(1500)
             }
