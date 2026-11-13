@@ -20,6 +20,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.media.MediaMetadataRetriever
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -51,6 +53,8 @@ import java.net.URL
 import kotlin.math.abs
 
 class Cue(var start: Double, var end: Double, var zh: String, var ar: String = "")
+
+class Prov(val name: String, val batch: Int, val pause: Long, val call: (List<Cue>, List<Cue>) -> List<String>)
 
 class ApiErr(val code: Int, body: String = "") : Exception("API $code " + body.replace(Regex("\\s+"), " ").take(160))
 
@@ -112,6 +116,8 @@ class MainActivity : Activity() {
     private lateinit var sTop: SeekBar
     private lateinit var sBot: SeekBar
     private lateinit var key: EditText
+    private lateinit var key2: EditText
+    private lateinit var key3: EditText
     private lateinit var etFrom: EditText
     private lateinit var etTo: EditText
     private lateinit var treeTv: TextView
@@ -146,11 +152,22 @@ class MainActivity : Activity() {
         sTop = bar(95, 80); sBot = bar(100, 98)
         col.addView(sTop); col.addView(sBot)
         key = EditText(this).apply {
-            hint = "Clé API : Gemini gratuite (AQ… ou AIza…) ou Claude (sk-…). Vide = hors ligne"
+            hint = "Clé Gemini (AQ… ou AIza…) ou Claude (sk-ant…)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setText(getSharedPreferences("p", 0).getString("k", ""))
         }
         col.addView(key)
+        key2 = EditText(this).apply {
+            hint = "Clé Groq (gsk_…) : serveur de secours 1"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(getSharedPreferences("p", 0).getString("kg", ""))
+        }
+        key3 = EditText(this).apply {
+            hint = "Clé OpenRouter (sk-or-…) : serveur de secours 2"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(getSharedPreferences("p", 0).getString("ko", ""))
+        }
+        col.addView(key2); col.addView(key3)
         etFrom = EditText(this).apply { hint = "Début de l’analyse (minutes)"; setText("0"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
         etTo = EditText(this).apply { hint = "Fin (minutes, 0 = toute la vidéo)"; setText("5"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
         col.addView(etFrom); col.addView(etTo)
@@ -394,7 +411,9 @@ class MainActivity : Activity() {
     private fun start() {
         if (running || uri == null) return
         val k = key.text.toString().trim()
-        getSharedPreferences("p", 0).edit().putString("k", k).apply()
+        val k2 = key2.text.toString().trim()
+        val k3 = key3.text.toString().trim()
+        getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply()
         val ct = sTop.progress; val cb = sBot.progress
         val full = durMs / 1000.0
         val rs = ((etFrom.text.toString().toDoubleOrNull() ?: 0.0) * 60).coerceAtLeast(0.0)
@@ -441,7 +460,7 @@ class MainActivity : Activity() {
                 cues = buildCues()
                 if (cues.isEmpty()) { ui("Aucun sous-titre détecté : vérifie la zone rouge."); return@Thread }
                 ui("${cues.size} sous-titres. Traduction…")
-                translateAll(key = k)
+                translateAll(k, k2, k3)
                 if (stop) { saveState(); ui("Arrêté pendant la traduction. Relance pour reprendre."); return@Thread }
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
                 saveState()
@@ -475,31 +494,113 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun translateAll(key: String) {
+    private fun online(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val c = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+        return c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private fun prepareOffline() {
+        try {
+            val tr = Translation.getClient(TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
+            Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+            tr.close()
+        } catch (e: Exception) {}
+    }
+
+    private fun translateAll(k1: String, k2: String, k3: String) {
         fellBack = false
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
-        if (key.isEmpty()) { offlineTranslate(todo()); return }
+        val chain = mutableListOf<Prov>()
+        val nKeys = listOf(k1, k2, k3).count { it.isNotEmpty() }
+        if (k1.startsWith("sk-ant")) chain.add(Prov("Claude", 25, 0L) { c, b -> claude(k1, c, b) })
+        else if (k1.isNotEmpty()) chain.add(Prov("Gemini", 40, 0L) { c, b -> gemini(k1, c, b, if (nKeys > 1) 4 else 12) })
+        if (k2.isNotEmpty()) chain.add(Prov("Groq", 25, 2500L) { c, b ->
+            oai("https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "gpt-oss-120b", "qwen"), false, c, b)
+        })
+        if (k3.isNotEmpty()) chain.add(Prov("OpenRouter", 20, 4000L) { c, b ->
+            oai("https://openrouter.ai/api/v1", k3, listOf("qwen", "llama-3.3-70b", "gpt-oss-120b", "gemma"), true, c, b)
+        })
+        if (chain.isEmpty()) { offlineTranslate(todo()); return }
+        if (!online()) {
+            fellBack = true
+            ui("Pas d’internet : traduction hors ligne directe…")
+            offlineTranslate(todo()); return
+        }
+        ui("Préparation du mode hors ligne (une seule fois)…")
+        prepareOffline()
+        val dead = HashSet<String>()
         while (!stop) {
-            val gem = !key.startsWith("sk-")
-            val b = todo().take(if (gem) 40 else 25); if (b.isEmpty()) break
+            if (!online()) dead.addAll(chain.map { it.name })
+            val prov = chain.firstOrNull { it.name !in dead }
+            if (prov == null) {
+                fellBack = true
+                ui("Serveurs indisponibles : passage à la traduction hors ligne…")
+                offlineTranslate(todo()); return
+            }
+            val b = todo().take(prov.batch); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
-            val res = try {
-                if (gem) gemini(key, ctx, b) else claude(key, ctx, b)
-            } catch (e: ApiErr) {
-                if (e.code != 429) throw e
-                fellBack = true
-                saveState()
-                ui("Quota gratuit atteint : passage automatique à la traduction hors ligne…")
-                offlineTranslate(todo())
-                return
+            try {
+                val res = prov.call(ctx, b)
+                b.forEachIndexed { j, c -> memo[c.zh] = res[j] }
+                val msg = "Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size} (${prov.name})"
+                ui(msg); notifyProgress(msg); saveState()
+                if (prov.pause > 0) Thread.sleep(prov.pause)
+            } catch (e: Exception) {
+                if (stop) return
+                dead.add(prov.name)
+                ui(prov.name + " indisponible (" + (if (e is ApiErr) e.code.toString() else "erreur") + ") : serveur suivant…")
+                Thread.sleep(1500)
             }
-            b.forEachIndexed { j, c -> memo[c.zh] = res[j] }
-            ui("Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size}")
-            notifyProgress("Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size}")
-            saveState()
         }
+    }
+
+    private val modelCache = HashMap<String, String>()
+    private val badModels = HashSet<String>()
+
+    private fun pickModel(base: String, key: String, prefs: List<String>, freeOnly: Boolean): String {
+        modelCache[base]?.let { return it }
+        val c = URL("$base/models").openConnection() as HttpURLConnection
+        c.setRequestProperty("Authorization", "Bearer $key"); c.connectTimeout = 20000; c.readTimeout = 30000
+        val code = c.responseCode
+        val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
+        if (code >= 400) throw ApiErr(code, txt)
+        val arr = JSONObject(txt).getJSONArray("data")
+        val skip = listOf("whisper", "embed", "guard", "tts", "orpheus", "image", "moderation", "vision", "safeguard", "compound")
+        val ids = (0 until arr.length()).map { arr.getJSONObject(it).getString("id") }
+            .filter { (!freeOnly || it.endsWith(":free")) && it !in badModels && skip.none { s -> it.contains(s, true) } }
+        val m = prefs.firstNotNullOfOrNull { p -> ids.firstOrNull { it.contains(p, true) } } ?: ids.firstOrNull()
+            ?: throw Exception("aucun modèle disponible")
+        modelCache[base] = m
+        return m
+    }
+
+    private fun oai(base: String, key: String, prefs: List<String>, freeOnly: Boolean, ctx: List<Cue>, b: List<Cue>): List<String> {
+        var err: Exception? = null
+        for (a in 1..3) {
+            var model = ""
+            try {
+                model = pickModel(base, key, prefs, freeOnly)
+                val body = JSONObject().put("model", model).put("temperature", 0.3)
+                    .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt(ctx, b))))
+                val txt = post("$base/chat/completions", mapOf("Authorization" to "Bearer $key"), body)
+                val out = JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+                return parse(out, b.size)
+            } catch (e: Exception) {
+                if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
+                err = e
+                if (e is ApiErr && (e.code == 400 || e.code == 404) && model.isNotEmpty()) { badModels.add(model); modelCache.remove(base) }
+                if (e !is ApiErr && !online()) throw e
+                if (e is ApiErr && e.code == 429 && a >= 2) break
+                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 20L * a else 3L * a
+                ui("Serveur occupé : nouvel essai dans $wait s…")
+                Thread.sleep(wait * 1000)
+            }
+        }
+        throw err!!
     }
 
     private fun prompt(ctx: List<Cue>, b: List<Cue>): String {
@@ -523,7 +624,8 @@ class MainActivity : Activity() {
         return p.toString()
     }
 
-    private fun parse(out: String, n: Int): List<String> {
+    private fun parse(raw: String, n: Int): List<String> {
+        val out = raw.replace(Regex("(?s)<think>.*?</think>"), "")
         val j = JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1))
         val arr = j.getJSONArray("t")
         if (arr.length() != n) throw Exception("nombre de lignes différent")
@@ -557,14 +659,14 @@ class MainActivity : Activity() {
         throw err!!
     }
 
-    private fun gemini(key: String, ctx: List<Cue>, b: List<Cue>): List<String> {
+    private fun gemini(key: String, ctx: List<Cue>, b: List<Cue>, tries: Int = 12): List<String> {
         val body = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt(ctx, b))))))
             .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0.3))
         var err: Exception? = null
-        for (a in 1..4) {
+        for (a in 1..tries) {
             try {
-                val model = if (a >= 3) "gemini-flash-lite-latest" else "gemini-flash-latest"
+                val model = if (a % 2 == 1) "gemini-flash-latest" else "gemini-flash-lite-latest"
                 val txt = post("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent", mapOf("x-goog-api-key" to key), body)
                 val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
                     .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
@@ -574,7 +676,11 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
-                Thread.sleep(if (e is ApiErr && e.code == 429) 25000L else 4000L * a)
+                if (e is ApiErr && e.code == 429 && a >= minOf(6, tries)) break
+                if (e !is ApiErr && !online()) throw e
+                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) minOf(300L, 20L * a) else 4L * a
+                ui("Gemini occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s…")
+                Thread.sleep(wait * 1000)
             }
         }
         throw err!!
