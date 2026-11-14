@@ -38,6 +38,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.app.AlertDialog
 import android.widget.*
 import com.google.android.gms.tasks.Tasks
@@ -126,6 +127,9 @@ class MainActivity : Activity() {
     @Volatile private var srcLang = "chinois"
     @Volatile private var srcIsEn = false
     private lateinit var panel: TextView
+    private lateinit var gbox: LinearLayout
+    private lateinit var gedit: EditText
+    private var gOriginal = ""
     private var rEnd = 0.0
     @Volatile private var stop = false
     @Volatile private var running = false
@@ -266,9 +270,22 @@ class MainActivity : Activity() {
             addView(ov, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = dp(70) })
             addView(btn("✕") { closePlayer() }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
         }
+        gedit = EditText(this).apply { minLines = 8; gravity = Gravity.TOP; setHorizontallyScrolling(false) }
+        gbox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.WHITE); visibility = View.GONE
+            setPadding(dp(12), dp(36), dp(12), dp(12))
+            addView(TextView(this@MainActivity).apply { text = "Mon glossaire : chinois = arabe\nUne ligne par terme, avec « = » entre les deux."; textSize = 16f })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(btn("Enregistrer") { saveGlossary(true) }, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(btn("Fermer") { closeGlossary() }, LinearLayout.LayoutParams(0, -2, 1f))
+            })
+            addView(ScrollView(this@MainActivity).apply { addView(gedit) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        }
         setContentView(FrameLayout(this).apply {
             addView(ScrollView(this@MainActivity).apply { addView(col) })
             addView(box)
+            addView(gbox, FrameLayout.LayoutParams(-1, -1))
         })
         renderPanel()
     }
@@ -322,39 +339,40 @@ class MainActivity : Activity() {
 
     private fun editGlossary() {
         val all = LinkedHashMap<String, String>(); all.putAll(glossary); all.putAll(userGl)
-        val et = EditText(this).apply {
-            setText(all.entries.joinToString("\n") { "${it.key} = ${it.value}" })
-            minLines = 8; gravity = Gravity.TOP
+        gedit.setText(all.entries.joinToString("\n") { "${it.key} = ${it.value}" })
+        gOriginal = gedit.text.toString()
+        gbox.visibility = View.VISIBLE
+    }
+
+    private fun saveGlossary(close: Boolean) {
+        val nu = LinkedHashMap<String, String>(); var ignored = 0
+        val sep = Regex("\\s*(.+?)\\s*(?:=|＝|→|->|：|:|\\t)\\s*(.+)")
+        for (l in gedit.text.toString().lines()) {
+            if (l.isBlank()) continue
+            val m = sep.matchEntire(l.trim())
+            if (m == null) { ignored++; continue }
+            nu[m.groupValues[1].trim()] = m.groupValues[2].trim()
         }
-        val original = et.text.toString()
-        fun save() {
-            val nu = LinkedHashMap<String, String>(); var ignored = 0
-            val sep = Regex("\\s*(.+?)\\s*(?:=|＝|→|->|：|:|\\t)\\s*(.+)")
-            for (l in et.text.toString().lines()) {
-                if (l.isBlank()) continue
-                val m = sep.matchEntire(l.trim())
-                if (m == null) { ignored++; continue }
-                nu[m.groupValues[1].trim()] = m.groupValues[2].trim()
-            }
-            userGl.clear(); userGl.putAll(nu); glossary.clear()
-            val ok = saveGl()
-            st.text = (if (ok) "Glossaire enregistré : ${nu.size} termes" else "ÉCHEC de l’enregistrement du glossaire") +
-                (if (ignored > 0) " ($ignored lignes ignorées : écris « chinois = arabe »)." else ".")
-        }
-        AlertDialog.Builder(this).setTitle("Mon glossaire : chinois = arabe")
-            .setMessage("Une ligne par terme, avec « = » entre les deux. Appuie sur Enregistrer pour garder tes modifications.")
-            .setView(ScrollView(this).apply { addView(et) })
-            .setCancelable(false)
-            .setPositiveButton("Enregistrer") { _, _ -> save() }
-            .setNegativeButton("Fermer") { _, _ ->
-                if (et.text.toString() != original) {
-                    AlertDialog.Builder(this).setTitle("Modifications non enregistrées")
-                        .setMessage("Les enregistrer avant de fermer ?")
-                        .setCancelable(false)
-                        .setPositiveButton("Enregistrer") { _, _ -> save() }
-                        .setNegativeButton("Perdre", null).show()
-                }
-            }.show()
+        userGl.clear(); userGl.putAll(nu); glossary.clear()
+        val ok = saveGl()
+        st.text = (if (ok) "Glossaire enregistré : ${nu.size} termes" else "ÉCHEC de l’enregistrement du glossaire") +
+            (if (ignored > 0) " ($ignored lignes ignorées : écris « chinois = arabe »)." else ".")
+        gOriginal = gedit.text.toString()
+        if (close) closeGlossaryNow()
+    }
+
+    private fun closeGlossaryNow() {
+        try { getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(gedit.windowToken, 0) } catch (e: Exception) {}
+        gbox.visibility = View.GONE
+    }
+
+    private fun closeGlossary() {
+        if (gedit.text.toString() == gOriginal) { closeGlossaryNow(); return }
+        AlertDialog.Builder(this).setTitle("Modifications non enregistrées")
+            .setMessage("Les enregistrer avant de fermer ?")
+            .setPositiveButton("Enregistrer") { _, _ -> saveGlossary(true) }
+            .setNeutralButton("Perdre") { _, _ -> closeGlossaryNow() }
+            .setNegativeButton("Continuer à modifier", null).show()
     }
 
     private fun offlineLine(tr: Translator, zh: String): String {
@@ -1143,5 +1161,9 @@ class MainActivity : Activity() {
 
     private fun closePlayer() { vv.stopPlayback(); box.visibility = View.GONE }
 
-    override fun onBackPressed() { if (box.visibility == View.VISIBLE) closePlayer() else super.onBackPressed() }
+    override fun onBackPressed() {
+        if (gbox.visibility == View.VISIBLE) closeGlossary()
+        else if (box.visibility == View.VISIBLE) closePlayer()
+        else super.onBackPressed()
+    }
 }
