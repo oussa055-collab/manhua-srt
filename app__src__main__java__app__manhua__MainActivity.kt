@@ -1200,11 +1200,14 @@ class MainActivity : Activity() {
             }.start()
             return
         }
-        val cur = gedit.text.toString().trimEnd()
-        gedit.setText(if (cur.isEmpty()) "$z = $a" else "$z = $a\n$cur")
+        val sepK = Regex("\\s*(.+?)\\s*(?:=|＝|→|->|：|:|\\t)\\s*(.+)")
+        val all = gedit.text.toString().lines()
+        val had = all.any { l -> sepK.matchEntire(l.trim())?.groupValues?.get(1)?.trim() == z }
+        val rest = all.filter { l -> sepK.matchEntire(l.trim())?.groupValues?.get(1)?.trim() != z }.joinToString("\n").trim()
+        gedit.setText(if (rest.isEmpty()) "$z = $a" else "$z = $a\n$rest")
         saveGlossary(false)
         addZh.setText(""); addAr.setText("")
-        Toast.makeText(this, "Ajouté : $z = $a", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, (if (had) "Remplacé : " else "Ajouté : ") + z + " = " + a, Toast.LENGTH_SHORT).show()
     }
 
     // ---------- mots fréquents de la vidéo ----------
