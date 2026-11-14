@@ -116,6 +116,8 @@ class MainActivity : Activity() {
     private val srcMap = HashMap<String, String>()
     private val pstate = LinkedHashMap<String, String>()
     private val pquota = LinkedHashMap<String, String>()
+    private val pmodel = LinkedHashMap<String, String>()
+    private val perr = LinkedHashMap<String, String>()
     private val retraSet = HashSet<String>()
     @Volatile private var phase = ""
     @Volatile private var phaseInfo = ""
@@ -666,8 +668,12 @@ class MainActivity : Activity() {
     private fun quotaLine(n: String): String {
         if (n == "Hors ligne") return "illimité (sur ton téléphone)"
         val q = synchronized(pquota) { pquota[n] }
+        val m = synchronized(pmodel) { pmodel[n] }
+        val e = synchronized(perr) { perr[n] }
         return "demandes envoyées aujourd’hui : " + usedToday(n) +
-            (if (q != null) " · $q" else if (n == "Gemini") " · reste exact : AI Studio > Usage (non fourni par l’API)" else "")
+            (if (q != null) " · $q" else if (n == "Gemini") " · reste exact : AI Studio > Usage (non fourni par l’API)" else "") +
+            (if (m != null) "\n     modèle : $m" else "") +
+            (if (e != null) "\n     dernière erreur : $e" else "")
     }
 
     private fun renderPanel() {
@@ -727,67 +733,81 @@ class MainActivity : Activity() {
             pstate["OpenRouter"] = if (k3.isEmpty()) "pas de clé" else "en attente"
             pstate["Hors ligne"] = "prêt"
         }
+        synchronized(perr) { perr.clear() }
         runOnUiThread { renderPanel() }
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
         val chain = mutableListOf<Prov>()
         val nKeys = listOf(k1, k2, k3).count { it.isNotEmpty() }
         if (k1.startsWith("sk-ant")) chain.add(Prov("Claude", 25, 0L) { c, b -> claude(k1, c, b) })
-        else if (k1.isNotEmpty()) chain.add(Prov("Gemini", 40, 0L) { c, b -> gemini(k1, c, b, if (nKeys > 1) 4 else 12) })
-        if (k2.isNotEmpty()) chain.add(Prov("Groq", 25, 2500L) { c, b ->
-            oai("Groq", "https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "gpt-oss-120b", "qwen"), false, c, b)
+        else if (k1.isNotEmpty()) chain.add(Prov("Gemini", 40, 0L) { c, b -> gemini(k1, c, b, if (nKeys > 1) 3 else 12) })
+        if (k2.isNotEmpty()) chain.add(Prov("Groq", 15, 2500L) { c, b ->
+            oai("Groq", "https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "qwen", "gpt-oss-120b"), false, c, b)
         })
-        if (k3.isNotEmpty()) chain.add(Prov("OpenRouter", 20, 4000L) { c, b ->
+        if (k3.isNotEmpty()) chain.add(Prov("OpenRouter", 12, 4000L) { c, b ->
             oai("OpenRouter", "https://openrouter.ai/api/v1", k3, listOf("qwen", "llama-3.3-70b", "gpt-oss-120b", "gemma"), true, c, b)
         })
         if (chain.isEmpty()) { offlineTranslate(todo()); return }
-        if (!online()) {
-            fellBack = true
-            failNotes = "pas d’internet"
-            ui("Pas d’internet : traduction hors ligne directe…")
-            offlineTranslate(todo()); return
+        if (online()) {
+            ui("Préparation du mode hors ligne (une seule fois)…")
+            prepareOffline()
+            if (k3.isNotEmpty()) refreshOrQuota(k3)
         }
-        ui("Préparation du mode hors ligne (une seule fois)…")
-        prepareOffline()
-        if (k3.isNotEmpty()) refreshOrQuota(k3)
-        val dead = HashSet<String>()
+        val until = HashMap<String, Long>()
+        val bsz = HashMap<String, Int>()
+        chain.forEach { bsz[it.name] = it.batch }
         while (!stop) {
-            if (!online()) {
-                if (!failNotes.contains("internet")) failNotes += "internet coupé "
-                dead.addAll(chain.map { it.name })
-            }
-            val prov = chain.firstOrNull { it.name !in dead }
+            val now = System.currentTimeMillis()
+            val onl = online()
+            val prov = if (onl) chain.firstOrNull { (until[it.name] ?: 0L) <= now } else null
             if (prov == null) {
+                val chunk = todo().take(150); if (chunk.isEmpty()) break
                 fellBack = true
-                ui("Serveurs indisponibles : passage à la traduction hors ligne…")
-                offlineTranslate(todo()); return
+                if (!onl && !failNotes.contains("internet")) failNotes += "internet coupé "
+                ui(if (onl) "Serveurs en pause : traduction hors ligne d’un bloc de ${chunk.size} lignes…" else "Pas d’internet : traduction hors ligne…")
+                offlineTranslate(chunk)
+                continue
             }
-            val b = todo().take(prov.batch); if (b.isEmpty()) break
+            val b = todo().take(minOf(bsz[prov.name] ?: prov.batch, prov.batch)); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
             activeName = prov.name
             pst(prov.name, "ACTIF — traduit un lot de ${b.size} lignes…")
             try {
                 val res = prov.call(ctx, b)
-                b.forEachIndexed { j, c -> memo[c.zh] = res[j]; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name) }
+                var got = 0
+                b.forEachIndexed { j, c ->
+                    val r = if (j < res.size) res[j] else ""
+                    if (r.isNotBlank()) { memo[c.zh] = r; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name); got++ }
+                }
+                if (got == 0) throw Exception("aucune ligne exploitable dans la réponse")
+                if (got < b.size) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) * 2 / 3)
+                synchronized(perr) { perr.remove(prov.name) }
                 val msg = "Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size} (${prov.name})"
                 ui(msg); notifyProgress(msg); saveState()
-                pst(prov.name, "ACTIF ✓ dernier lot : ${b.size} lignes")
+                pst(prov.name, "ACTIF ✓ dernier lot : $got/${b.size} lignes")
                 if (prov.name == "OpenRouter") refreshOrQuota(k3)
                 if (prov.pause > 0) Thread.sleep(prov.pause)
             } catch (e: Exception) {
                 if (stop) return
-                dead.add(prov.name)
                 val code = if (e is ApiErr) e.code.toString() else "erreur"
+                val cool = when {
+                    e is ApiErr && (e.code == 401 || e.code == 403) -> 6 * 3600 * 1000L
+                    e is ApiErr && e.code == 429 -> 30 * 60 * 1000L
+                    else -> 3 * 60 * 1000L
+                }
+                until[prov.name] = System.currentTimeMillis() + cool
+                if (e !is ApiErr) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) / 2)
+                synchronized(perr) { perr[prov.name] = (e.message ?: e.toString()).replace(Regex("\\s+"), " ").take(160) }
                 failNotes += prov.name + " (" + code + ") "
-                pst(prov.name, "en échec ($code) : mis de côté")
+                pst(prov.name, "en pause ($code) — nouvel essai dans ${cool / 60000} min")
                 activeName = ""
-                ui(prov.name + " indisponible (" + code + ") : serveur suivant…")
-                Thread.sleep(1500)
+                ui(prov.name + " en pause (" + code + ") : serveur suivant…")
+                Thread.sleep(1000)
             }
         }
         activeName = ""
-        chain.forEach { if (it.name !in dead) pst(it.name, "terminé") }
+        chain.forEach { if ((until[it.name] ?: 0L) <= System.currentTimeMillis()) pst(it.name, "terminé") }
     }
 
     private fun provOf(url: String) = when {
@@ -852,7 +872,7 @@ class MainActivity : Activity() {
                 if (k3.isNotEmpty()) refreshOrQuota(k3)
                 if (k2.isNotEmpty()) {
                     val base = "https://api.groq.com/openai/v1"
-                    val model = pickModel(base, k2, listOf("llama-3.3-70b", "llama-4", "gpt-oss-120b", "qwen"), false)
+                    val model = pickModels(base, k2, listOf("llama-3.3-70b", "llama-4", "qwen", "gpt-oss-120b"), false).first()
                     val body = JSONObject().put("model", model).put("max_tokens", 1)
                         .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "ok")))
                     try { post("$base/chat/completions", mapOf("Authorization" to "Bearer $k2"), body) } catch (e: ApiErr) {}
@@ -863,11 +883,10 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private val modelCache = HashMap<String, String>()
-    private val badModels = HashSet<String>()
+    private val modelList = HashMap<String, List<String>>()
 
-    private fun pickModel(base: String, key: String, prefs: List<String>, freeOnly: Boolean): String {
-        modelCache[base]?.let { return it }
+    private fun pickModels(base: String, key: String, prefs: List<String>, freeOnly: Boolean): List<String> {
+        modelList[base]?.let { return it }
         val c = URL("$base/models").openConnection() as HttpURLConnection
         c.setRequestProperty("Authorization", "Bearer $key"); c.connectTimeout = 20000; c.readTimeout = 30000
         val code = c.responseCode
@@ -876,33 +895,37 @@ class MainActivity : Activity() {
         val arr = JSONObject(txt).getJSONArray("data")
         val skip = listOf("whisper", "embed", "guard", "tts", "orpheus", "image", "moderation", "vision", "safeguard", "compound")
         val ids = (0 until arr.length()).map { arr.getJSONObject(it).getString("id") }
-            .filter { (!freeOnly || it.endsWith(":free")) && it !in badModels && skip.none { s -> it.contains(s, true) } }
-        val m = prefs.firstNotNullOfOrNull { p -> ids.firstOrNull { it.contains(p, true) } } ?: ids.firstOrNull()
-            ?: throw Exception("aucun modèle disponible")
-        modelCache[base] = m
-        return m
+            .filter { (!freeOnly || it.endsWith(":free")) && skip.none { s -> it.contains(s, true) } }
+        val ordered = LinkedHashSet<String>()
+        for (p in prefs) ids.filter { it.contains(p, true) }.forEach { ordered.add(it) }
+        ids.forEach { ordered.add(it) }
+        val l = ordered.take(6).toList()
+        if (l.isEmpty()) throw Exception("aucun modèle disponible")
+        modelList[base] = l
+        return l
     }
 
     private fun oai(name: String, base: String, key: String, prefs: List<String>, freeOnly: Boolean, ctx: List<Cue>, b: List<Cue>): List<String> {
         var err: Exception? = null
-        for (a in 1..3) {
-            var model = ""
+        val models = pickModels(base, key, prefs, freeOnly)
+        for (a in 1..4) {
+            val model = models[(a - 1) % models.size]
+            synchronized(pmodel) { pmodel[name] = model }
             try {
-                model = pickModel(base, key, prefs, freeOnly)
                 val body = JSONObject().put("model", model).put("temperature", 0.3)
                     .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt(ctx, b))))
                 val txt = post("$base/chat/completions", mapOf("Authorization" to "Bearer $key"), body)
-                val out = JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+                val msg = JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+                val out = msg.optString("content", "")
+                if (out.isBlank() || out == "null") throw Exception("réponse vide ($model)")
                 return parse(out, b.size)
             } catch (e: Exception) {
                 if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
-                if (e is ApiErr && (e.code == 400 || e.code == 404) && model.isNotEmpty()) { badModels.add(model); modelCache.remove(base) }
                 if (e !is ApiErr && !online()) throw e
-                if (e is ApiErr && e.code == 429 && a >= 2) break
-                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 20L * a else 3L * a
-                pst(name, "occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s")
-                ui("Serveur occupé : nouvel essai dans $wait s…")
+                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 4L else 2L
+                val c = if (e is ApiErr) e.code.toString() else "erreur"
+                pst(name, "essai $a/4 échoué ($c) : autre modèle dans $wait s")
                 Thread.sleep(wait * 1000)
             }
         }
@@ -924,8 +947,10 @@ class MainActivity : Activity() {
             ctx.forEach { p.append(it.zh).append(" => ").append(memo[it.zh]).append("\n") }
             p.append("\n")
         }
-        p.append("Lignes à traduire (tableau JSON) :\n").append(JSONArray(b.map { it.zh })).append("\n\n")
-        p.append("Réponds uniquement par un objet JSON {\"t\":[${b.size} chaînes arabes dans le même ordre],\"g\":{\"nom chinois\":\"nom arabe\"}} ; ")
+        val numbered = JSONObject(); b.forEachIndexed { i, c -> numbered.put((i + 1).toString(), c.zh) }
+        p.append("Lignes à traduire (objet JSON numéroté) :\n").append(numbered).append("\n\n")
+        p.append("Réponds uniquement par un objet JSON {\"t\":{\"1\":\"traduction arabe de la ligne 1\",\"2\":\"...\"},\"g\":{\"nom chinois\":\"nom arabe\"}} ; ")
+        p.append("t contient exactement une entrée par numéro, avec les mêmes numéros (${b.size} lignes). ")
         p.append("g ne contient que les NOUVEAUX noms propres ou termes clés.")
         return p.toString()
     }
@@ -933,11 +958,16 @@ class MainActivity : Activity() {
     private fun parse(raw: String, n: Int): List<String> {
         val out = raw.replace(Regex("(?s)<think>.*?</think>"), "")
         val j = JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1))
-        val arr = j.getJSONArray("t")
-        if (arr.length() != n) throw Exception("nombre de lignes différent")
-        j.optJSONObject("g")?.let { g -> g.keys().forEach { if (!glossary.containsKey(it) && !userGl.containsKey(it)) glossary[it] = g.getString(it) } }
+        val res = MutableList(n) { "" }
+        val t = j.opt("t")
+        if (t is JSONObject) {
+            for (i in 1..n) { val v = t.optString(i.toString(), ""); res[i - 1] = if (v == "null") "" else v }
+        } else if (t is JSONArray && t.length() == n) {
+            for (i in 0 until n) res[i] = t.optString(i, "")
+        } else throw Exception("format de réponse inattendu")
+        j.optJSONObject("g")?.let { g -> g.keys().forEach { if (!glossary.containsKey(it) && !userGl.containsKey(it)) glossary[it] = g.optString(it, "") } }
         while (glossary.size > 5000) glossary.remove(glossary.keys.first())
-        return List(arr.length()) { arr.getString(it) }
+        return res
     }
 
     private fun post(url: String, headers: Map<String, String>, body: JSONObject): String {
@@ -974,9 +1004,12 @@ class MainActivity : Activity() {
         for (a in 1..tries) {
             try {
                 val model = if (a % 2 == 1) "gemini-flash-latest" else "gemini-flash-lite-latest"
+                synchronized(pmodel) { pmodel["Gemini"] = model }
                 val txt = post("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent", mapOf("x-goog-api-key" to key), body)
-                val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
-                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                val cands = JSONObject(txt).optJSONArray("candidates")
+                if (cands == null || cands.length() == 0) throw Exception("Gemini : réponse vide ou bloquée " + txt.replace(Regex("\\s+"), " ").take(100))
+                val out = cands.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text", "") ?: ""
+                if (out.isBlank()) throw Exception("Gemini : texte vide (fin : " + cands.getJSONObject(0).optString("finishReason", "?") + ")")
                 val r = parse(out, b.size)
                 Thread.sleep(5000)
                 return r
