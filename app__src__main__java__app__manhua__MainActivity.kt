@@ -274,16 +274,16 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER; setOnClickListener { mode = (mode + 1) % 3 }
         }
         box = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK); visibility = View.GONE
+            setBackgroundColor(Color.BLACK); visibility = View.GONE; isClickable = true
             addView(vv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
             addView(ov, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = dp(70) })
             addView(btn("✕") { closePlayer() }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
         }
-        addZh = EditText(this).apply { hint = "Mot chinois"; setSingleLine(true) }
+        addZh = EditText(this).apply { hint = "Mot chinois (ou mot à chercher)"; setSingleLine(true) }
         addAr = EditText(this).apply { hint = "Arabe (vide = auto)"; setSingleLine(true) }
         gedit = EditText(this).apply { minLines = 8; gravity = Gravity.TOP; setHorizontallyScrolling(false) }
         gbox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.WHITE); visibility = View.GONE
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.WHITE); visibility = View.GONE; isClickable = true
             setPadding(dp(12), dp(36), dp(12), dp(12))
             addView(TextView(this@MainActivity).apply { text = "Mon glossaire : chinois = arabe\nUne ligne par terme, avec « = » entre les deux. Pour ajouter vite : remplis les deux cases puis « Ajouter » (arabe vide = traduction automatique)."; textSize = 16f })
             addView(LinearLayout(this@MainActivity).apply {
@@ -299,8 +299,9 @@ class MainActivity : Activity() {
             })
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
+                addView(btn("Chercher") { searchGlossary() }, LinearLayout.LayoutParams(0, -2, 1f))
                 addView(btn("Mots de la vidéo") { openDetected() }, LinearLayout.LayoutParams(0, -2, 1f))
-                addView(btn("Importer des phrases") { pickPhrases() }, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(btn("Importer phrases") { pickPhrases() }, LinearLayout.LayoutParams(0, -2, 1f))
             })
             addView(ScrollView(this@MainActivity).apply { addView(gedit) }, LinearLayout.LayoutParams(-1, 0, 1f))
         }
@@ -1159,6 +1160,27 @@ class MainActivity : Activity() {
                 runOnUiThread { Toast.makeText(this, "Import impossible : ${e.message}", Toast.LENGTH_LONG).show() }
             }
         }.start()
+    }
+
+    // ---------- recherche dans le glossaire ----------
+    private fun searchGlossary() {
+        val q = addZh.text.toString().trim().ifEmpty { addAr.text.toString().trim() }
+        if (q.isEmpty()) { Toast.makeText(this, "Écris le mot à chercher dans l’une des deux cases.", Toast.LENGTH_SHORT).show(); return }
+        val sep = Regex("\\s*(.+?)\\s*(?:=|＝|→|->|：|:|\\t)\\s*(.+)")
+        val exact = mutableListOf<String>(); val near = mutableListOf<String>()
+        for (l in gedit.text.toString().lines()) {
+            val m = sep.matchEntire(l.trim()) ?: continue
+            val k = m.groupValues[1].trim(); val v = m.groupValues[2].trim()
+            if (k == q || v == q) exact.add(k + " = " + v)
+            else if (k.contains(q, true) || v.contains(q, true) || (k.length >= 2 && q.contains(k))) near.add(k + " = " + v)
+        }
+        val ph = synchronized(phrases) { phrases[norm(q)] }
+        val msg = StringBuilder()
+        if (exact.isNotEmpty()) msg.append("✓ Ce mot existe dans le glossaire :\n").append(exact.take(10).joinToString("\n"))
+        else msg.append("✗ Ce mot n’existe pas tel quel dans le glossaire.")
+        if (near.isNotEmpty()) msg.append("\n\nTermes proches (").append(near.size).append(") :\n").append(near.take(15).joinToString("\n"))
+        if (ph != null) msg.append("\n\nMémoire de phrases : ").append(q).append(" = ").append(ph)
+        AlertDialog.Builder(this).setTitle("Recherche : " + q).setMessage(msg.toString()).setPositiveButton("OK", null).show()
     }
 
     // ---------- ajout de termes ----------
