@@ -19,6 +19,11 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Typeface
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.media.MediaMetadataRetriever
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -110,6 +115,10 @@ class MainActivity : Activity() {
     private val srcMap = HashMap<String, String>()
     private val pstate = LinkedHashMap<String, String>()
     private val pquota = LinkedHashMap<String, String>()
+    private val retraSet = HashSet<String>()
+    @Volatile private var phase = ""
+    @Volatile private var phaseInfo = ""
+    @Volatile private var lastOk = false
     @Volatile private var activeName = ""
     @Volatile private var firstName = "Gemini"
     @Volatile private var srtMode = false
@@ -191,7 +200,7 @@ class MainActivity : Activity() {
         goB = btn("2. Analyser et traduire") { start() }.also { it.isEnabled = false }
         col.addView(goB)
         col.addView(btn("Arrêter (la progression est gardée)") { stop = true })
-        panel = TextView(this).apply { setTextColor(0xFF1B7F3A.toInt()); textSize = 14f; setPadding(0, dp(10), 0, dp(10)) }
+        panel = TextView(this).apply { setTextColor(0xFF555555.toInt()); textSize = 14f; setPadding(0, dp(10), 0, dp(10)) }
         col.addView(panel)
         col.addView(btn("Vérifier mes quotas (Gemini, Groq, OpenRouter)") { checkQuotas() })
         playB = btn("3. Lire avec sous-titres") { play() }.also { it.isEnabled = false }
@@ -205,7 +214,7 @@ class MainActivity : Activity() {
                 null
             ) {
                 backupState()
-                memo.clear(); offlineKeys.clear(); srcMap.clear(); saveState(); playB.isEnabled = false
+                memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); saveState(); playB.isEnabled = false
                 st.text = "Traductions effacées. Appuie sur « 2 » pour retraduire avec ton glossaire."
             }
         })
@@ -217,8 +226,10 @@ class MainActivity : Activity() {
             ) {
                 backupState()
                 val n = offlineKeys.size
+                retraSet.clear(); retraSet.addAll(offlineKeys)
                 offlineKeys.forEach { memo.remove(it); srcMap.remove(it) }; offlineKeys.clear(); saveState(); playB.isEnabled = false
                 st.text = "$n lignes hors ligne effacées. Appuie sur « 2 » pour les retraduire avec tes serveurs."
+                renderPanel()
             }
         })
         col.addView(btn("Restaurer la dernière progression effacée") {
@@ -235,7 +246,7 @@ class MainActivity : Activity() {
                 "EFFACER"
             ) {
                 backupState()
-                items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); done = 0.0; cues = listOf()
+                items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); done = 0.0; cues = listOf()
                 sf().delete()
                 playB.isEnabled = false
                 st.text = "Progression effacée. Une copie de secours existe : « Restaurer »."
@@ -451,13 +462,13 @@ class MainActivity : Activity() {
         }
         val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot).put("rs", savedStart)
         o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
-        o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList())).put("src", JSONObject(srcMap.toMap()))
+        o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList())).put("src", JSONObject(srcMap.toMap())).put("ret", JSONArray(retraSet.toList()))
         sf().writeText(o.toString())
         saveGl()
     }
 
     private fun loadState() {
-        items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
+        items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
         val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
         done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
@@ -466,6 +477,7 @@ class MainActivity : Activity() {
         val m = o.getJSONObject("memo"); m.keys().forEach { memo[it] = m.getString(it) }
         offlineKeys.clear(); o.optJSONArray("off")?.let { a -> for (i in 0 until a.length()) offlineKeys.add(a.getString(i)) }
         o.optJSONObject("src")?.let { s2 -> s2.keys().forEach { srcMap[it] = s2.getString(it) } }
+        o.optJSONArray("ret")?.let { a -> for (i in 0 until a.length()) retraSet.add(a.getString(i)) }
         if (items.isNotEmpty()) { cues = buildCues(); cues.forEach { it.ar = memo[it.zh] ?: "" } }
     }
 
@@ -530,7 +542,7 @@ class MainActivity : Activity() {
         if (savedTop != ct || savedBot != cb || savedStart != rs) { items.clear(); done = 0.0 }
         done = maxOf(done, rs)
         savedTop = ct; savedBot = cb; savedStart = rs; rEnd = re
-        running = true; stop = false; goB.isEnabled = false
+        running = true; stop = false; goB.isEnabled = false; lastOk = false; phase = ""
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ensureChannel(this)
         startForegroundService(Intent(this, KeepAliveService::class.java))
@@ -559,7 +571,8 @@ class MainActivity : Activity() {
                         }
                         t += STEP; done = t
                         if (System.currentTimeMillis() - ls > 20000) { saveState(); ls = System.currentTimeMillis(); notifyProgress("Analyse ${hms(t)} / ${hms(dur)}") }
-                        ui("Analyse ${hms(t)} / ${hms(dur)} · ${items.size} changements")
+                        phaseInfo = "Analyse ${hms(t)} / ${hms(dur)} · ${items.size} changements"; phase = "analyse"
+                        ui(phaseInfo); runOnUiThread { renderPanel() }
                     }
                     r.release(); saveState()
                 }
@@ -575,14 +588,16 @@ class MainActivity : Activity() {
                 val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
                 val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
                 ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
+                lastOk = true
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
                 try { saveState() } catch (x: Exception) {}
                 ui("Erreur : ${e.message ?: e}. La progression est gardée : relance pour reprendre.")
             } finally {
                 running = false
+                phase = if (stop) "arrêté" else if (lastOk) "terminé" else "erreur"
                 stopService(Intent(this, KeepAliveService::class.java))
-                runOnUiThread { goB.isEnabled = true; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+                runOnUiThread { goB.isEnabled = true; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); renderPanel() }
             }
         }.start()
     }
@@ -630,34 +645,62 @@ class MainActivity : Activity() {
         runOnUiThread { renderPanel() }
     }
 
+    private fun quotaLine(n: String): String {
+        if (n == "Hors ligne") return "illimité (sur ton téléphone)"
+        val q = synchronized(pquota) { pquota[n] }
+        return "demandes envoyées aujourd’hui : " + usedToday(n) +
+            (if (q != null) " · $q" else if (n == "Gemini") " · reste exact : AI Studio > Usage (non fourni par l’API)" else "")
+    }
+
     private fun renderPanel() {
+        val green = 0xFF1B7F3A.toInt()
         val names = listOf(firstName, "Groq", "OpenRouter", "Hors ligne")
         val total = cues.count { memo[it.zh] != null }
-        val sb = StringBuilder()
-        sb.append("Serveur actif : ").append(if (activeName.isEmpty()) "aucun" else activeName)
-            .append(" · Internet : ").append(if (online()) "oui" else "non")
-            .append("\nTotal traduit : ").append(total).append(" / ").append(cues.size).append("\n")
+        val head = StringBuilder()
+        when {
+            phase == "analyse" -> head.append("▶ EN MARCHE : ").append(phaseInfo)
+            activeName.isNotEmpty() -> {
+                val cnt = cues.count { srcMap[it.zh] == codeOf(activeName) }
+                val s = synchronized(pstate) { pstate[activeName] ?: "" }
+                head.append("▶ SERVEUR ACTIF : ").append(activeName).append(" — en marche\n   ").append(s)
+                    .append("\n   Traduit par ").append(activeName).append(" : ").append(cnt).append(" lignes")
+                    .append("\n   ").append(quotaLine(activeName))
+            }
+            phase == "traduction" -> head.append("▶ Traduction : choix du serveur…")
+            phase == "terminé" -> head.append("✓ Travail terminé")
+            phase == "arrêté" -> head.append("■ Arrêté (progression gardée)")
+            phase == "erreur" -> head.append("✗ Arrêt sur erreur (progression gardée)")
+            else -> head.append("Serveur actif : aucun")
+        }
+        head.append("\nTotal traduit : ").append(total).append(" / ").append(cues.size).append(" · reste : ").append(cues.size - total)
+        if (retraSet.isNotEmpty()) {
+            val rem = retraSet.count { memo[it] == null || srcMap[it] == "H" }
+            head.append("\nRetraduction de la partie hors ligne : reste ").append(rem).append(" / ").append(retraSet.size)
+            if (rem == 0) head.append(" ✓ terminée")
+        }
+        val rest = StringBuilder("\n\nInternet : ").append(if (online()) "oui" else "non").append("\nAutres serveurs :\n")
         var known = 0
         for (n in names) {
-            val code = codeOf(n)
-            val cnt = cues.count { srcMap[it.zh] == code }
+            val cnt = cues.count { srcMap[it.zh] == codeOf(n) }
             known += cnt
+            if (n == activeName) continue
             val s = synchronized(pstate) { pstate[n] ?: "en attente" }
-            sb.append(if (n == activeName) "▶ " else "• ").append(n).append(" — ").append(s).append(" — ").append(cnt).append(" lignes\n")
-            val q = synchronized(pquota) { pquota[n] }
-            val ql = if (n == "Hors ligne") "illimité (sur ton téléphone)"
-                else "demandes envoyées aujourd’hui : " + usedToday(n) +
-                    (if (q != null) " · $q" else if (n == "Gemini") " · reste exact : AI Studio > Usage (non fourni par l’API)" else "")
-            sb.append("     ").append(ql).append("\n")
+            rest.append("• ").append(n).append(" — ").append(s).append(" — ").append(cnt).append(" lignes\n     ")
+                .append(quotaLine(n)).append("\n")
         }
-        if (total > known) sb.append("• Avant cette version : ").append(total - known).append(" lignes\n")
-        panel.text = sb.toString().trimEnd()
+        if (total > known) rest.append("• Avant cette version : ").append(total - known).append(" lignes\n")
+        val sp = SpannableStringBuilder(head.toString())
+        sp.setSpan(ForegroundColorSpan(green), 0, sp.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sp.setSpan(StyleSpan(Typeface.BOLD), 0, sp.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sp.append(rest.toString().trimEnd())
+        panel.text = sp
     }
 
     private fun translateAll(k1: String, k2: String, k3: String) {
         fellBack = false
         failNotes = ""
         activeName = ""
+        phase = "traduction"
         firstName = if (k1.startsWith("sk-ant")) "Claude" else "Gemini"
         synchronized(pstate) {
             pstate.clear()
@@ -989,7 +1032,7 @@ class MainActivity : Activity() {
         getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply()
         val name = nameOf(u)
         val outBase = name.substringBeforeLast('.')
-        running = true; stop = false; srtMode = true; goB.isEnabled = false
+        running = true; stop = false; srtMode = true; goB.isEnabled = false; lastOk = false; phase = ""; retraSet.clear()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ensureChannel(this)
         startForegroundService(Intent(this, KeepAliveService::class.java))
@@ -1012,6 +1055,7 @@ class MainActivity : Activity() {
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
                 val inTree = outFile("$outBase.ar.srt", srt { it.ar })
                 File(filesDir, "srt_$srtKey.json").delete()
+                lastOk = true
                 ui("SRT traduit ✓ ${cues.size} sous-titres ($srcLang → arabe). Fichier : $outBase.ar.srt " +
                     (if (inTree) "dans le dossier de sortie choisi." else "dans Téléchargements."))
             } catch (e: Exception) {
@@ -1019,6 +1063,7 @@ class MainActivity : Activity() {
                 ui("Erreur : ${e.message ?: e}. Progression gardée : relance le même fichier.")
             } finally {
                 srtMode = false; srcIsEn = false; srcLang = "chinois"; running = false
+                phase = if (stop) "arrêté" else if (lastOk) "terminé" else "erreur"
                 stopService(Intent(this, KeepAliveService::class.java))
                 runOnUiThread {
                     goB.isEnabled = true; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
