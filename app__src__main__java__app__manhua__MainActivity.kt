@@ -64,6 +64,8 @@ class Prov(val name: String, val batch: Int, val pause: Long, val call: (List<Cu
 
 class ApiErr(val code: Int, body: String = "") : Exception("API $code " + body.replace(Regex("\\s+"), " ").take(160))
 
+class ParseErr(m: String) : Exception(m)
+
 fun ensureChannel(c: Context) {
     c.getSystemService(NotificationManager::class.java)
         .createNotificationChannel(NotificationChannel("work", "Analyse en cours", NotificationManager.IMPORTANCE_LOW))
@@ -104,6 +106,10 @@ class MainActivity : Activity() {
     private val items = mutableListOf<Pair<Double, String>>()
     private val memo = HashMap<String, String>()
     private val glossary = LinkedHashMap<String, String>()
+    private val phrases = LinkedHashMap<String, String>()
+    @Volatile private var phDirty = false
+    private lateinit var addZh: EditText
+    private lateinit var addAr: EditText
     private val userGl = LinkedHashMap<String, String>()
     private var cues = listOf<Cue>()
     private var done = 0.0
@@ -157,6 +163,7 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         loadGl()
+        loadPhrases()
         val d = resources.displayMetrics.density
         fun dp(x: Int) = (x * d).toInt()
         fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
@@ -272,15 +279,28 @@ class MainActivity : Activity() {
             addView(ov, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = dp(70) })
             addView(btn("✕") { closePlayer() }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
         }
+        addZh = EditText(this).apply { hint = "Mot chinois"; setSingleLine(true) }
+        addAr = EditText(this).apply { hint = "Arabe (vide = auto)"; setSingleLine(true) }
         gedit = EditText(this).apply { minLines = 8; gravity = Gravity.TOP; setHorizontallyScrolling(false) }
         gbox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.WHITE); visibility = View.GONE
             setPadding(dp(12), dp(36), dp(12), dp(12))
-            addView(TextView(this@MainActivity).apply { text = "Mon glossaire : chinois = arabe\nUne ligne par terme, avec « = » entre les deux."; textSize = 16f })
+            addView(TextView(this@MainActivity).apply { text = "Mon glossaire : chinois = arabe\nUne ligne par terme, avec « = » entre les deux. Pour ajouter vite : remplis les deux cases puis « Ajouter » (arabe vide = traduction automatique)."; textSize = 16f })
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 addView(btn("Enregistrer") { saveGlossary(true) }, LinearLayout.LayoutParams(0, -2, 1f))
                 addView(btn("Fermer") { closeGlossary() }, LinearLayout.LayoutParams(0, -2, 1f))
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(addZh, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(addAr, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(btn("Ajouter") { addTermFromFields() }, LinearLayout.LayoutParams(-2, -2))
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(btn("Mots de la vidéo") { openDetected() }, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(btn("Importer des phrases") { pickPhrases() }, LinearLayout.LayoutParams(0, -2, 1f))
             })
             addView(ScrollView(this@MainActivity).apply { addView(gedit) }, LinearLayout.LayoutParams(-1, 0, 1f))
         }
@@ -332,6 +352,7 @@ class MainActivity : Activity() {
     }
 
     @Synchronized private fun saveGl(): Boolean {
+        savePhrases()
         return try {
             File(filesDir, "glossaire.json").writeText(
                 JSONObject().put("user", JSONObject(userGl.toMap())).put("learned", JSONObject(glossary.toMap())).toString())
@@ -379,6 +400,7 @@ class MainActivity : Activity() {
 
     private fun offlineLine(tr: Translator, zh: String): String {
         userGl[zh]?.let { return it }
+        if (!srcIsEn) synchronized(phrases) { phrases[norm(zh)] }?.let { return it }
         val terms = (userGl.keys + glossary.keys).filter { it.length >= 2 && zh.contains(it) }.sortedByDescending { it.length }
         if (terms.isEmpty()) return Tasks.await(tr.translate(zh))
         var parts = listOf(false to zh)
@@ -429,6 +451,11 @@ class MainActivity : Activity() {
         if (rq == 4) {
             val su = d?.data
             if (rc == RESULT_OK && su != null) translateSrtFile(su)
+            return
+        }
+        if (rq == 5) {
+            val pu = d?.data
+            if (rc == RESULT_OK && pu != null) importPhrases(pu)
             return
         }
         val u = d?.data ?: return
@@ -529,7 +556,7 @@ class MainActivity : Activity() {
 
     private fun ocr(rec: TextRecognizer, b: Bitmap): String {
         val r = Tasks.await(rec.process(InputImage.fromBitmap(b, 0)))
-        val s = r.textBlocks.flatMap { it.lines }.joinToString(" ") { it.text }.trim()
+        val s = clean(r.textBlocks.flatMap { it.lines }.joinToString(" ") { it.text })
         return if (Regex("[\\u4e00-\\u9fff]").containsMatchIn(s)) s else ""
     }
 
@@ -755,6 +782,7 @@ class MainActivity : Activity() {
         }
         val until = HashMap<String, Long>()
         val bsz = HashMap<String, Int>()
+        val pf = HashMap<String, Int>()
         chain.forEach { bsz[it.name] = it.batch }
         while (!stop) {
             val now = System.currentTimeMillis()
@@ -778,11 +806,12 @@ class MainActivity : Activity() {
                 var got = 0
                 b.forEachIndexed { j, c ->
                     val r = if (j < res.size) res[j] else ""
-                    if (r.isNotBlank()) { memo[c.zh] = r; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name); got++ }
+                    if (r.isNotBlank()) { memo[c.zh] = r; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name); got++; learnPhrase(c.zh, r) }
                 }
                 if (got == 0) throw Exception("aucune ligne exploitable dans la réponse")
                 if (got < b.size) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) * 2 / 3)
                 synchronized(perr) { perr.remove(prov.name) }
+                pf[prov.name] = 0
                 val msg = "Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size} (${prov.name})"
                 ui(msg); notifyProgress(msg); saveState()
                 pst(prov.name, "ACTIF ✓ dernier lot : $got/${b.size} lignes")
@@ -790,6 +819,22 @@ class MainActivity : Activity() {
                 if (prov.pause > 0) Thread.sleep(prov.pause)
             } catch (e: Exception) {
                 if (stop) return
+                if (e is ParseErr && (pf[prov.name] ?: 0) < 3) {
+                    pf[prov.name] = (pf[prov.name] ?: 0) + 1
+                    val cur = bsz[prov.name] ?: prov.batch
+                    synchronized(perr) { perr[prov.name] = "réponse illisible (ignorée, on continue)" }
+                    if (b.size <= 3) {
+                        pst(prov.name, "réponse illisible : ${b.size} ligne(s) traduite(s) hors ligne, on continue")
+                        activeName = ""
+                        try { offlineTranslate(b) } catch (x: Exception) {}
+                        bsz[prov.name] = minOf(prov.batch, 8)
+                    } else {
+                        bsz[prov.name] = maxOf(3, cur / 2)
+                        pst(prov.name, "réponse illisible : nouvel essai avec un lot plus petit")
+                    }
+                    Thread.sleep(500)
+                    continue
+                }
                 val code = if (e is ApiErr) e.code.toString() else "erreur"
                 val cool = when {
                     e is ApiErr && (e.code == 401 || e.code == 403) -> 6 * 3600 * 1000L
@@ -893,7 +938,7 @@ class MainActivity : Activity() {
         val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
         if (code >= 400) throw ApiErr(code, txt)
         val arr = JSONObject(txt).getJSONArray("data")
-        val skip = listOf("whisper", "embed", "guard", "tts", "orpheus", "image", "moderation", "vision", "safeguard", "compound")
+        val skip = listOf("whisper", "embed", "guard", "tts", "orpheus", "image", "moderation", "vision", "safeguard", "compound", "allam")
         val ids = (0 until arr.length()).map { arr.getJSONObject(it).getString("id") }
             .filter { (!freeOnly || it.endsWith(":free")) && skip.none { s -> it.contains(s, true) } }
         val ordered = LinkedHashSet<String>()
@@ -922,6 +967,7 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
+                if (e is ParseErr && a >= 2) throw e
                 if (e !is ApiErr && !online()) throw e
                 val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 4L else 2L
                 val c = if (e is ApiErr) e.code.toString() else "erreur"
@@ -947,25 +993,56 @@ class MainActivity : Activity() {
             ctx.forEach { p.append(it.zh).append(" => ").append(memo[it.zh]).append("\n") }
             p.append("\n")
         }
-        val numbered = JSONObject(); b.forEachIndexed { i, c -> numbered.put((i + 1).toString(), c.zh) }
+        val numbered = JSONObject(); b.forEachIndexed { i, c -> numbered.put((i + 1).toString(), clean(c.zh)) }
         p.append("Lignes à traduire (objet JSON numéroté) :\n").append(numbered).append("\n\n")
         p.append("Réponds uniquement par un objet JSON {\"t\":{\"1\":\"traduction arabe de la ligne 1\",\"2\":\"...\"},\"g\":{\"nom chinois\":\"nom arabe\"}} ; ")
         p.append("t contient exactement une entrée par numéro, avec les mêmes numéros (${b.size} lignes). ")
-        p.append("g ne contient que les NOUVEAUX noms propres ou termes clés.")
+        p.append("g ne contient que les NOUVEAUX noms propres ou termes clés. ")
+        p.append("Dans les traductions, n’utilise jamais le guillemet droit \" : utilise « » à la place. Le JSON doit être complet et valide.")
         return p.toString()
     }
 
+    private fun unesc(s: String): String = try { JSONArray("[\"" + s + "\"]").getString(0) } catch (e: Exception) { s }
+
+    private fun clean(s: String) = s.replace(Regex("[\\p{Cc}\\p{Cf}\\uFFFD]"), " ").replace(Regex("\\s+"), " ").trim()
+
+    private fun addTerm(k: String, v: String) {
+        val kk = k.trim(); val vv = v.trim()
+        if (kk.isEmpty() || vv.isEmpty() || kk == vv || kk.all { it.isDigit() }) return
+        if (!glossary.containsKey(kk) && !userGl.containsKey(kk)) glossary[kk] = vv
+    }
+
     private fun parse(raw: String, n: Int): List<String> {
-        val out = raw.replace(Regex("(?s)<think>.*?</think>"), "")
-        val j = JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1))
+        val out = raw.replace(Regex("(?s)<think>.*?</think>"), "").replace("```json", "").replace("```", "")
         val res = MutableList(n) { "" }
-        val t = j.opt("t")
-        if (t is JSONObject) {
-            for (i in 1..n) { val v = t.optString(i.toString(), ""); res[i - 1] = if (v == "null") "" else v }
-        } else if (t is JSONArray && t.length() == n) {
-            for (i in 0 until n) res[i] = t.optString(i, "")
-        } else throw Exception("format de réponse inattendu")
-        j.optJSONObject("g")?.let { g -> g.keys().forEach { if (!glossary.containsKey(it) && !userGl.containsKey(it)) glossary[it] = g.optString(it, "") } }
+        var ok = false
+        try {
+            val a = out.indexOf('{'); val z = out.lastIndexOf('}')
+            if (a >= 0 && z > a) {
+                val j = JSONObject(out.substring(a, z + 1))
+                val t = j.opt("t")
+                if (t is JSONObject) {
+                    for (i in 1..n) { val v = t.optString(i.toString(), ""); res[i - 1] = if (v == "null") "" else v }
+                    ok = true
+                } else if (t is JSONArray && t.length() == n) {
+                    for (i in 0 until n) res[i] = t.optString(i, "")
+                    ok = true
+                }
+                j.optJSONObject("g")?.let { g -> g.keys().forEach { addTerm(it, g.optString(it, "")) } }
+            }
+        } catch (e: Exception) { ok = false }
+        if (!ok) {
+            // JSON cassé : on récupère toutes les lignes complètes, on ignore le reste
+            val rx = Regex("\"(\\d{1,4})\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+            for (m in rx.findAll(out)) {
+                val i = m.groupValues[1].toIntOrNull() ?: continue
+                val v = unesc(m.groupValues[2]).trim()
+                if (i in 1..n && res[i - 1].isEmpty() && v.isNotEmpty() && v != "null" && !(v.length <= 2 && v.all { it.isDigit() })) res[i - 1] = v
+            }
+            val rg = Regex("\"([^\"\\\\]*[\\u4e00-\\u9fff][^\"\\\\]*)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+            for (m in rg.findAll(out)) addTerm(unesc(m.groupValues[1]), unesc(m.groupValues[2]))
+        }
+        if (res.all { it.isBlank() }) throw ParseErr("réponse illisible (JSON cassé)")
         while (glossary.size > 5000) glossary.remove(glossary.keys.first())
         return res
     }
@@ -1016,6 +1093,7 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
+                if (e is ParseErr && a >= 2) throw e
                 if (e is ApiErr && e.code == 429 && a >= minOf(6, tries)) break
                 if (e !is ApiErr && !online()) throw e
                 val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) minOf(300L, 20L * a) else 4L * a
@@ -1025,6 +1103,229 @@ class MainActivity : Activity() {
             }
         }
         throw err!!
+    }
+
+    // ---------- mémoire de phrases ----------
+    private fun learnPhrase(zh: String, ar: String) {
+        if (srcIsEn) return
+        val k = norm(zh)
+        if (k.length < 2 || k.length > 30 || ar.isBlank()) return
+        synchronized(phrases) {
+            phrases[k] = ar
+            while (phrases.size > 8000) phrases.remove(phrases.keys.first())
+            phDirty = true
+        }
+    }
+
+    private fun loadPhrases() {
+        try {
+            val f = File(filesDir, "phrases.json"); if (!f.exists()) return
+            val o = JSONObject(f.readText())
+            o.keys().forEach { phrases[it] = o.getString(it) }
+        } catch (e: Exception) {}
+    }
+
+    @Synchronized private fun savePhrases() {
+        if (!phDirty) return
+        try {
+            val snap = synchronized(phrases) { LinkedHashMap(phrases) }
+            File(filesDir, "phrases.json").writeText(JSONObject(snap.toMap()).toString())
+            phDirty = false
+        } catch (e: Exception) {}
+    }
+
+    private fun pickPhrases() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE), 5)
+    }
+
+    private fun importPhrases(u: Uri) {
+        Thread {
+            try {
+                val txt = contentResolver.openInputStream(u)!!.use { it.readBytes() }.toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                val sep = Regex("\\s*(.+?)\\s*(?:=|＝|→|->|：|:|\\t)\\s*(.+)")
+                var n = 0
+                synchronized(phrases) {
+                    for (l in txt.lines()) {
+                        val m = sep.matchEntire(l.trim()) ?: continue
+                        val k = norm(m.groupValues[1]); val v = m.groupValues[2].trim()
+                        if (k.isEmpty() || v.isEmpty()) continue
+                        phrases[k] = v; n++
+                    }
+                    phDirty = true
+                }
+                savePhrases()
+                runOnUiThread { Toast.makeText(this, "$n phrases importées (mémoire : ${phrases.size})", Toast.LENGTH_LONG).show() }
+            } catch (e: Exception) {
+                runOnUiThread { Toast.makeText(this, "Import impossible : ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        }.start()
+    }
+
+    // ---------- ajout de termes ----------
+    private fun addTermFromFields() {
+        val z = addZh.text.toString().trim(); val a = addAr.text.toString().trim()
+        if (z.isEmpty()) { Toast.makeText(this, "Écris d’abord le mot chinois.", Toast.LENGTH_SHORT).show(); return }
+        if (a.isEmpty()) {
+            val k1 = key.text.toString().trim(); val k2 = key2.text.toString().trim(); val k3 = key3.text.toString().trim()
+            Toast.makeText(this, "Traduction en cours…", Toast.LENGTH_SHORT).show()
+            Thread {
+                val m: Map<String, String> = try { translateTerms(k1, k2, k3, listOf(z), emptyMap()) } catch (e: Exception) { emptyMap() }
+                runOnUiThread {
+                    val t = m[z]
+                    if (t == null) Toast.makeText(this, "Pas de traduction automatique : écris-la toi-même.", Toast.LENGTH_LONG).show()
+                    else { addAr.setText(t); Toast.makeText(this, "Vérifie la traduction puis touche Ajouter.", Toast.LENGTH_LONG).show() }
+                }
+            }.start()
+            return
+        }
+        val cur = gedit.text.toString().trimEnd()
+        gedit.setText(if (cur.isEmpty()) "$z = $a" else "$z = $a\n$cur")
+        saveGlossary(false)
+        addZh.setText(""); addAr.setText("")
+        Toast.makeText(this, "Ajouté : $z = $a", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---------- mots fréquents de la vidéo ----------
+    private val stopCh = "的了是在我你他她它们这那有不就也都和与及而或但把被让给对向从到着过吗呢吧啊呀哦嗯么说道"
+
+    private fun detectTerms(snap: List<Pair<Double, String>>): List<Pair<String, Int>> {
+        val cjk = Regex("[\\u4e00-\\u9fff]+")
+        val counts = HashMap<String, Int>()
+        for ((_, zh) in snap) {
+            for (run in cjk.findAll(zh)) {
+                val s = run.value
+                for (n in 2..4) for (i in 0..s.length - n) {
+                    val g = s.substring(i, i + n); counts[g] = (counts[g] ?: 0) + 1
+                }
+            }
+        }
+        val cand = counts.entries.filter { e ->
+            e.value >= 3 && stopCh.indexOf(e.key.first()) < 0 && stopCh.indexOf(e.key.last()) < 0 &&
+                !userGl.containsKey(e.key) && !glossary.containsKey(e.key)
+        }.sortedWith(compareByDescending<Map.Entry<String, Int>> { it.key.length }.thenByDescending { it.value })
+        val acc = mutableListOf<Pair<String, Int>>()
+        for (e in cand) {
+            if (acc.any { p -> p.first.contains(e.key) && p.second >= e.value * 0.7 }) continue
+            acc.add(e.key to e.value)
+        }
+        return acc.sortedByDescending { it.second }.take(150)
+    }
+
+    private fun openDetected() {
+        if (running) { Toast.makeText(this, "Attends la fin du travail en cours.", Toast.LENGTH_LONG).show(); return }
+        if (items.isEmpty()) {
+            Toast.makeText(this, "Choisis d’abord ta vidéo : l’analyse déjà faite est retrouvée automatiquement.", Toast.LENGTH_LONG).show(); return
+        }
+        val snap = items.toList()
+        Toast.makeText(this, "Recherche des mots fréquents…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val list: List<Pair<String, Int>> = try { detectTerms(snap) } catch (e: Exception) { emptyList() }
+            runOnUiThread {
+                if (list.isEmpty()) {
+                    Toast.makeText(this, "Aucun nouveau mot fréquent trouvé.", Toast.LENGTH_LONG).show()
+                } else {
+                    val labels = list.map { it.first + "  ·  " + it.second + "×" }.toTypedArray()
+                    val checked = BooleanArray(list.size) { list[it].second >= 5 }
+                    AlertDialog.Builder(this).setTitle("Mots fréquents de la vidéo")
+                        .setMultiChoiceItems(labels, checked) { _, i, c -> checked[i] = c }
+                        .setPositiveButton("Traduire et ajouter") { _, _ ->
+                            val words = list.indices.filter { checked[it] }.map { list[it].first }
+                            if (words.isNotEmpty()) addTranslated(words, snap)
+                        }
+                        .setNegativeButton("Annuler", null).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun addTranslated(words: List<String>, snap: List<Pair<Double, String>>) {
+        val k1 = key.text.toString().trim(); val k2 = key2.text.toString().trim(); val k3 = key3.text.toString().trim()
+        Toast.makeText(this, "Traduction de ${words.size} mots…", Toast.LENGTH_LONG).show()
+        Thread {
+            val ex = HashMap<String, String>()
+            for (w in words) snap.firstOrNull { it.second.contains(w) }?.let { ex[w] = it.second.take(50) }
+            val m: Map<String, String> = try { translateTerms(k1, k2, k3, words, ex) } catch (e: Exception) { emptyMap() }
+            runOnUiThread {
+                if (m.isEmpty()) {
+                    Toast.makeText(this, "Traduction impossible pour l’instant (quota ou internet).", Toast.LENGTH_LONG).show()
+                } else {
+                    val lines = m.entries.joinToString("\n") { it.key + " = " + it.value }
+                    val cur = gedit.text.toString().trimEnd()
+                    gedit.setText(if (cur.isEmpty()) lines else lines + "\n" + cur)
+                    saveGlossary(false)
+                    Toast.makeText(this, "${m.size} termes ajoutés en haut de la liste : vérifie-les.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun translateTerms(k1: String, k2: String, k3: String, words: List<String>, ex: Map<String, String>): Map<String, String> {
+        val obj = JSONObject(); words.forEach { obj.put(it, ex[it] ?: "") }
+        val p = "Ce sont des mots ou expressions chinois fréquents dans un manhua (clé = le mot, valeur = une ligne d’exemple où il apparaît). " +
+            "Traduis chaque mot en arabe standard moderne : transcris phonétiquement en arabe les noms de personnes et de lieux, traduis les termes et les titres. " +
+            "Si ce n’est pas un vrai mot ou un vrai nom (simple morceau de phrase), mets une chaîne vide. " +
+            "Réponds uniquement par un objet JSON {\"mot chinois\":\"traduction arabe\"}, sans guillemet droit à l’intérieur des traductions.\n\n" + obj.toString()
+        val order = mutableListOf<() -> String>()
+        if (k1.startsWith("sk-ant")) order.add { askClaude(k1, p) } else if (k1.isNotEmpty()) order.add { askGemini(k1, p) }
+        if (k2.isNotEmpty()) order.add { askOai("https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "qwen", "gpt-oss-120b"), false, p) }
+        if (k3.isNotEmpty()) order.add { askOai("https://openrouter.ai/api/v1", k3, listOf("qwen", "llama-3.3-70b", "gpt-oss-120b", "gemma"), true, p) }
+        var raw = ""
+        if (online()) {
+            for (f in order) {
+                try { raw = f(); if (raw.isNotBlank()) break } catch (e: Exception) {}
+            }
+        }
+        val res = LinkedHashMap<String, String>()
+        if (raw.isNotBlank()) {
+            val s = raw.replace(Regex("(?s)<think>.*?</think>"), "")
+            val rx = Regex("\"((?:\\\\.|[^\"\\\\])*)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+            for (m in rx.findAll(s)) {
+                val k = unesc(m.groupValues[1]); val v = unesc(m.groupValues[2]).trim()
+                if (words.contains(k) && v.isNotEmpty() && v != k) res[k] = v
+            }
+        }
+        if (res.isEmpty()) {
+            // aucun serveur n'a répondu : traduction hors ligne mot à mot (moins bonne, à vérifier)
+            try {
+                val tr = Translation.getClient(TranslatorOptions.Builder()
+                    .setSourceLanguage(TranslateLanguage.CHINESE).setTargetLanguage(TranslateLanguage.ARABIC).build())
+                Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+                for (w in words) { val t = Tasks.await(tr.translate(w)).trim(); if (t.isNotEmpty()) res[w] = t }
+                tr.close()
+            } catch (e: Exception) {}
+        }
+        return res
+    }
+
+    private fun askGemini(key: String, text: String): String {
+        val body = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text)))))
+            .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0.2))
+        var err: Exception? = null
+        for (model in listOf("gemini-flash-latest", "gemini-flash-lite-latest")) {
+            try {
+                val txt = post("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent", mapOf("x-goog-api-key" to key), body)
+                val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0).getJSONObject("content")
+                    .getJSONArray("parts").getJSONObject(0).getString("text")
+                if (out.isNotBlank()) return out
+            } catch (e: Exception) { err = e }
+        }
+        throw err ?: Exception("réponse vide")
+    }
+
+    private fun askOai(base: String, key: String, prefs: List<String>, freeOnly: Boolean, text: String): String {
+        val model = pickModels(base, key, prefs, freeOnly).first()
+        val body = JSONObject().put("model", model).put("temperature", 0.2)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", text)))
+        val txt = post("$base/chat/completions", mapOf("Authorization" to "Bearer $key"), body)
+        return JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message").optString("content", "")
+    }
+
+    private fun askClaude(key: String, text: String): String {
+        val body = JSONObject().put("model", "claude-sonnet-5-5").put("max_tokens", 4096)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", text)))
+        val txt = post("https://api.anthropic.com/v1/messages", mapOf("x-api-key" to key, "anthropic-version" to "2023-06-01"), body)
+        return JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text")
     }
 
     private fun pickSrt() {
