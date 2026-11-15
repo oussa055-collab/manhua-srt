@@ -111,6 +111,7 @@ class MainActivity : Activity() {
     private val phrases = LinkedHashMap<String, String>()
     @Volatile private var phDirty = false
     @Volatile private var libBusy = false
+    @Volatile private var offDone = 0
     private lateinit var addZh: EditText
     private lateinit var addAr: EditText
     private val userGl = LinkedHashMap<String, String>()
@@ -659,7 +660,11 @@ class MainActivity : Activity() {
             .setSourceLanguage(if (srcIsEn) TranslateLanguage.ENGLISH else TranslateLanguage.CHINESE)
             .setTargetLanguage(TranslateLanguage.ARABIC).build())
         activeName = "Hors ligne"; pst("Hors ligne", "ACTIF — préparation du modèle local…")
-        ui("Téléchargement du modèle hors ligne (une seule fois)…")
+        val haveModel = try {
+            Tasks.await(RemoteModelManager.getInstance().isModelDownloaded(
+                TranslateRemoteModel.Builder(if (srcIsEn) TranslateLanguage.ENGLISH else TranslateLanguage.CHINESE).build()))
+        } catch (e: Exception) { false }
+        if (!haveModel) ui("Téléchargement du modèle hors ligne (une seule fois)…")
         Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
         pst("Hors ligne", "ACTIF — traduction locale")
         var n = 0
@@ -667,12 +672,14 @@ class MainActivity : Activity() {
             if (stop) return
             if (memo[c.zh] != null) continue
             memo[c.zh] = offlineLine(tr, c.zh); offlineKeys.add(c.zh); srcMap[c.zh] = "H"
+            offDone++
             if (++n % 25 == 0) {
-                ui("Traduction hors ligne : $n"); notifyProgress("Traduction hors ligne : $n"); saveState()
-                pst("Hors ligne", "ACTIF — $n lignes ce passage")
+                ui("Traduction hors ligne : $offDone"); notifyProgress("Traduction hors ligne : $offDone"); saveState()
+                pst("Hors ligne", "ACTIF — $offDone lignes au total")
             }
         }
-        pst("Hors ligne", "terminé — $n lignes ce passage"); activeName = ""
+        try { tr.close() } catch (e: Exception) {}
+        pst("Hors ligne", "terminé — $offDone lignes au total"); activeName = ""
     }
 
     private fun online(): Boolean = try {
@@ -767,6 +774,7 @@ class MainActivity : Activity() {
         }
         synchronized(perr) { perr.clear() }
         runOnUiThread { renderPanel() }
+        offDone = 0
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
         val chain = mutableListOf<Prov>()
