@@ -43,7 +43,9 @@ import android.app.AlertDialog
 import android.widget.*
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
@@ -108,6 +110,7 @@ class MainActivity : Activity() {
     private val glossary = LinkedHashMap<String, String>()
     private val phrases = LinkedHashMap<String, String>()
     @Volatile private var phDirty = false
+    @Volatile private var libBusy = false
     private lateinit var addZh: EditText
     private lateinit var addAr: EditText
     private val userGl = LinkedHashMap<String, String>()
@@ -220,6 +223,7 @@ class MainActivity : Activity() {
         col.addView(playB)
         col.addView(btn("Traduire un fichier .srt (chinois ou anglais → arabe)") { if (!running) pickSrt() })
         col.addView(btn("Mon glossaire (noms et termes)") { editGlossary() })
+        col.addView(btn("Bibliothèque hors ligne (télécharger / mettre à jour)") { openLibrary() })
         col.addView(btn("Retraduire avec le glossaire (garde l’analyse)") {
             if (!running && uri != null) confirmDanger(
                 "Retraduire toute la vidéo ?",
@@ -1158,6 +1162,83 @@ class MainActivity : Activity() {
                 runOnUiThread { Toast.makeText(this, "$n phrases importées (mémoire : ${phrases.size})", Toast.LENGTH_LONG).show() }
             } catch (e: Exception) {
                 runOnUiThread { Toast.makeText(this, "Import impossible : ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        }.start()
+    }
+
+    // ---------- bibliothèque hors ligne ----------
+    private val libLangs = listOf(
+        TranslateLanguage.CHINESE to "Chinois",
+        TranslateLanguage.ARABIC to "Arabe",
+        TranslateLanguage.ENGLISH to "Anglais (langue relais)"
+    )
+
+    private fun libStatus(): Map<String, Boolean> {
+        val mm = RemoteModelManager.getInstance()
+        val have = Tasks.await(mm.getDownloadedModels(TranslateRemoteModel::class.java)).map { it.language }.toSet()
+        return libLangs.associate { it.first to have.contains(it.first) }
+    }
+
+    private fun openLibrary() {
+        if (running) { Toast.makeText(this, "Attends la fin du travail en cours.", Toast.LENGTH_LONG).show(); return }
+        if (libBusy) { Toast.makeText(this, "Un téléchargement est déjà en cours.", Toast.LENGTH_LONG).show(); return }
+        Toast.makeText(this, "Vérification de la bibliothèque…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val s: Map<String, Boolean>? = try { libStatus() } catch (e: Exception) { null }
+            runOnUiThread {
+                val sb = StringBuilder()
+                if (s == null) {
+                    sb.append("Impossible de lire l’état de la bibliothèque.")
+                } else {
+                    for (l in libLangs) sb.append(if (s[l.first] == true) "✓ " else "✗ ").append(l.second).append("\n")
+                    if (s[TranslateLanguage.CHINESE] == true && s[TranslateLanguage.ARABIC] == true)
+                        sb.append("\nLa bibliothèque est déjà sur ton téléphone : rien à retélécharger, le téléchargement ne se fait qu’une seule fois.")
+                    else
+                        sb.append("\nIl manque des éléments : touche « Télécharger » (Wi‑Fi conseillé, environ 30 Mo par langue).")
+                }
+                sb.append("\n\nGoogle ne donne aucun moyen de savoir si une version plus récente existe. « Mettre à jour » efface les modèles puis les retélécharge.")
+                AlertDialog.Builder(this).setTitle("Bibliothèque hors ligne").setMessage(sb.toString())
+                    .setPositiveButton("Télécharger") { _, _ -> downloadLibrary(false) }
+                    .setNeutralButton("Mettre à jour") { _, _ ->
+                        confirmDanger(
+                            "Mettre à jour la bibliothèque ?",
+                            "Les modèles hors ligne seront effacés puis retéléchargés (environ 100 Mo). Garde internet allumé : si le téléchargement échoue, le hors ligne ne marche plus jusqu’à ce que tu relances « Télécharger ».",
+                            null
+                        ) { downloadLibrary(true) }
+                    }
+                    .setNegativeButton("Fermer", null).show()
+            }
+        }.start()
+    }
+
+    private fun downloadLibrary(refresh: Boolean) {
+        if (!online()) { Toast.makeText(this, "Pas d’internet : connecte-toi puis réessaie.", Toast.LENGTH_LONG).show(); return }
+        if (libBusy) { Toast.makeText(this, "Un téléchargement est déjà en cours.", Toast.LENGTH_LONG).show(); return }
+        libBusy = true
+        Thread {
+            var fail = ""
+            val mm = RemoteModelManager.getInstance()
+            try {
+                val have: Map<String, Boolean> = if (refresh) emptyMap() else libStatus()
+                for (l in libLangs) {
+                    if (!refresh && have[l.first] == true) continue
+                    ui("Bibliothèque hors ligne : téléchargement " + l.second + "…")
+                    val model = TranslateRemoteModel.Builder(l.first).build()
+                    try {
+                        if (refresh) { try { Tasks.await(mm.deleteDownloadedModel(model)) } catch (e: Exception) {} }
+                        Tasks.await(mm.download(model, DownloadConditions.Builder().build()))
+                    } catch (e: Exception) { fail += l.second + " " }
+                }
+            } catch (e: Exception) { fail = "état illisible " }
+            libBusy = false
+            runOnUiThread {
+                if (fail.isEmpty()) {
+                    st.text = "Bibliothèque hors ligne prête ✓"
+                    Toast.makeText(this, "Bibliothèque hors ligne prête ✓", Toast.LENGTH_LONG).show()
+                } else {
+                    st.text = "Téléchargement incomplet (" + fail.trim() + "). Réessaie avec une meilleure connexion."
+                    Toast.makeText(this, "Échec : " + fail.trim() + ". Réessaie.", Toast.LENGTH_LONG).show()
+                }
             }
         }.start()
     }
