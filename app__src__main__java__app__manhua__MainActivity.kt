@@ -64,7 +64,7 @@ class Cue(var start: Double, var end: Double, var zh: String, var ar: String = "
 
 class Prov(val name: String, val batch: Int, val pause: Long, val call: (List<Cue>, List<Cue>) -> List<String>)
 
-class ApiErr(val code: Int, body: String = "") : Exception("API $code " + body.replace(Regex("\\s+"), " ").take(160))
+class ApiErr(val code: Int, body: String = "") : Exception("API $code " + body.replace(Regex("\\s+"), " ").take(160)) { var resetMs: Long = -1L }
 
 class ParseErr(m: String) : Exception(m)
 
@@ -129,6 +129,15 @@ class MainActivity : Activity() {
     private val pmodel = LinkedHashMap<String, String>()
     private val perr = LinkedHashMap<String, String>()
     private val retraSet = HashSet<String>()
+    private val pReset = HashMap<String, Long>()
+    @Volatile private var autoGlN = 0
+    private lateinit var key4: EditText
+    @Volatile private var k4 = ""
+    @Volatile private var geminiName = "Gemini"
+    @Volatile private var transStart = 0L
+    @Volatile private var transBase = 0
+    private lateinit var pbar: ProgressBar
+    private lateinit var ptxt: TextView
     private val asr = ArrayList<Seg>()
     private var asrDone = 0.0
     private val zhFix = HashMap<String, String>()
@@ -202,6 +211,12 @@ class MainActivity : Activity() {
             setText(getSharedPreferences("p", 0).getString("k", ""))
         }
         col.addView(key)
+        key4 = EditText(this).apply {
+            hint = "2e clé Gemini (autre projet Google) : optionnel"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(getSharedPreferences("p", 0).getString("k4", ""))
+        }
+        col.addView(key4)
         key2 = EditText(this).apply {
             hint = "Clé Groq (gsk_…) : serveur de secours 1"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -229,6 +244,10 @@ class MainActivity : Activity() {
         goB = btn("2. Analyser et traduire") { start() }.also { it.isEnabled = false }
         col.addView(goB)
         col.addView(btn("Arrêter (la progression est gardée)") { stop = true })
+        ptxt = TextView(this).apply { setTextColor(0xFF1B7F3A.toInt()); textSize = 16f; setTypeface(null, Typeface.BOLD); setPadding(0, dp(12), 0, dp(2)); text = "Progression de la traduction : 0 %" }
+        col.addView(ptxt)
+        pbar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000; progress = 0 }
+        col.addView(pbar, LinearLayout.LayoutParams(-1, dp(14)))
         panel = TextView(this).apply { setTextColor(0xFF555555.toInt()); textSize = 14f; setPadding(0, dp(10), 0, dp(10)) }
         col.addView(panel)
         col.addView(btn("Vérifier mes quotas (Gemini, Groq, OpenRouter)") { checkQuotas() })
@@ -604,7 +623,7 @@ class MainActivity : Activity() {
         val k = key.text.toString().trim()
         val k2 = key2.text.toString().trim()
         val k3 = key3.text.toString().trim()
-        getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply()
+        getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply(); k4 = key4.text.toString().trim(); getSharedPreferences("p", 0).edit().putString("k4", k4).apply()
         val ct = sTop.progress; val cb = sBot.progress
         val full = durMs / 1000.0
         val rs = ((etFrom.text.toString().toDoubleOrNull() ?: 0.0) * 60).coerceAtLeast(0.0)
@@ -658,6 +677,7 @@ class MainActivity : Activity() {
                 attachHints(cues)
                 if (cues.isEmpty()) { ui("Aucun sous-titre détecté : vérifie la zone rouge."); return@Thread }
                 ui("${cues.size} sous-titres. Traduction…")
+                autoGlossary(k, k2, k3)
                 translateAll(k, k2, k3)
                 if (stop) { saveState(); ui("Arrêté pendant la traduction. Relance pour reprendre."); return@Thread }
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
@@ -665,8 +685,9 @@ class MainActivity : Activity() {
                 val inTree = exportAll()
                 val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
                 val fixNote = if (useAsr) (" Audio : ${asr.size} phrases, ${cues.count { zhFix.containsKey(it.zh) }} lignes de chinois corrigées." + (if (asr.isNotEmpty()) " Fichier $base.audio.srt = audio brut." else "") + asrNote) else ""
+                val glNote = if (autoGlN > 0) " Glossaire : $autoGlN mots ajoutés automatiquement (à vérifier dans « Mon glossaire »)." else ""
                 val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
-                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote$fixNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
+                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote$fixNote$glNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
                 lastOk = true
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
@@ -790,7 +811,7 @@ class MainActivity : Activity() {
         } catch (e: Exception) {}
     }
 
-    private fun codeOf(n: String) = when (n) { "Gemini" -> "G"; "Groq" -> "Q"; "OpenRouter" -> "O"; "Claude" -> "C"; else -> "H" }
+    private fun codeOf(n: String) = when (n) { "Gemini" -> "G"; "Gemini 2" -> "g"; "Groq" -> "Q"; "OpenRouter" -> "O"; "Claude" -> "C"; else -> "H" }
 
     private fun pst(n: String, t: String) {
         synchronized(pstate) { pstate[n] = t }
@@ -803,14 +824,15 @@ class MainActivity : Activity() {
         val m = synchronized(pmodel) { pmodel[n] }
         val e = synchronized(perr) { perr[n] }
         return "demandes envoyées aujourd’hui : " + usedToday(n) +
-            (if (q != null) " · $q" else if (n == "Gemini") " · reste exact : AI Studio > Usage (non fourni par l’API)" else "") +
+            (if (q != null) " · $q" else if (n.startsWith("Gemini")) " · reste exact : AI Studio > Usage (non fourni par l’API)" else "") +
+            (synchronized(pReset) { pReset[n] }?.let { ra -> if (ra > System.currentTimeMillis()) "\n     ⏳ limite atteinte : reprise dans " + fmtDur(ra - System.currentTimeMillis()) + " (vers " + hhmm(ra) + ")" else null } ?: "") +
             (if (m != null) "\n     modèle : $m" else "") +
             (if (e != null) "\n     dernière erreur : $e" else "")
     }
 
     private fun renderPanel() {
         val green = 0xFF1B7F3A.toInt()
-        val names = listOf(firstName, "Groq", "OpenRouter", "Hors ligne")
+        val names = ArrayList<String>().apply { add(firstName); if (k4.isNotEmpty()) add("Gemini 2"); add("Groq"); add("OpenRouter"); add("Hors ligne") }
         val total = cues.count { memo[it.zh] != null }
         val head = StringBuilder()
         when {
@@ -845,6 +867,18 @@ class MainActivity : Activity() {
                 .append(quotaLine(n)).append("\n")
         }
         if (total > known) rest.append("• Avant cette version : ").append(total - known).append(" lignes\n")
+        run {
+            val tot = cues.size
+            val pm = if (tot == 0) 0 else (total * 1000L / tot).toInt()
+            pbar.progress = pm
+            val sb = StringBuilder("Progression de la traduction : ").append(pm / 10).append(",").append(pm % 10).append(" %  (").append(total).append(" / ").append(tot).append(" lignes)")
+            val dn = total - transBase
+            val el = System.currentTimeMillis() - transStart
+            if ((phase == "traduction" || activeName.isNotEmpty()) && tot > total && dn >= 10 && el > 30000L && transStart > 0L)
+                sb.append("\nTemps restant estimé : ").append(fmtDur((tot - total) * el / dn))
+            if (tot in 1..total) sb.append(" ✓")
+            ptxt.text = sb.toString()
+        }
         val sp = SpannableStringBuilder(head.toString())
         sp.setSpan(ForegroundColorSpan(green), 0, sp.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         sp.setSpan(StyleSpan(Typeface.BOLD), 0, sp.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -861,6 +895,7 @@ class MainActivity : Activity() {
         synchronized(pstate) {
             pstate.clear()
             pstate[firstName] = if (k1.isEmpty()) "pas de clé" else "en attente"
+            if (k4.isNotEmpty()) pstate["Gemini 2"] = "en attente"
             pstate["Groq"] = if (k2.isEmpty()) "pas de clé" else "en attente"
             pstate["OpenRouter"] = if (k3.isEmpty()) "pas de clé" else "en attente"
             pstate["Hors ligne"] = "prêt"
@@ -871,9 +906,10 @@ class MainActivity : Activity() {
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
         fun todo() = cues.filter { memo[it.zh] == null }
         val chain = mutableListOf<Prov>()
-        val nKeys = listOf(k1, k2, k3).count { it.isNotEmpty() }
+        val nKeys = listOf(k1, k2, k3, k4).count { it.isNotEmpty() }
         if (k1.startsWith("sk-ant")) chain.add(Prov("Claude", 25, 0L) { c, b -> claude(k1, c, b) })
-        else if (k1.isNotEmpty()) chain.add(Prov("Gemini", 40, 0L) { c, b -> gemini(k1, c, b, if (nKeys > 1) 3 else 12) })
+        else if (k1.isNotEmpty()) chain.add(Prov("Gemini", 40, 0L) { c, b -> geminiName = "Gemini"; gemini(k1, c, b, if (nKeys > 1) 3 else 12, "Gemini") })
+        if (k4.isNotEmpty()) chain.add(Prov("Gemini 2", 40, 0L) { c, b -> geminiName = "Gemini 2"; gemini(k4, c, b, if (nKeys > 1) 3 else 12, "Gemini 2") })
         if (k2.isNotEmpty()) chain.add(Prov("Groq", 15, 2500L) { c, b ->
             oai("Groq", "https://api.groq.com/openai/v1", k2, listOf("llama-3.3-70b", "llama-4", "qwen", "gpt-oss-120b"), false, c, b)
         })
@@ -889,12 +925,61 @@ class MainActivity : Activity() {
         val until = HashMap<String, Long>()
         val bsz = HashMap<String, Int>()
         val pf = HashMap<String, Int>()
+        val netFail = HashMap<String, Int>()
+        val down = HashSet<String>()
+        val probeAt = HashMap<String, Long>()
+        val resetKnown = HashSet<String>()
+        val back = HashSet<String>()
+        val far = Long.MAX_VALUE / 4
+        var cur = ""
+        synchronized(pReset) { pReset.clear() }
+        transStart = System.currentTimeMillis(); transBase = cues.count { memo[it.zh] != null }
         chain.forEach { bsz[it.name] = it.batch }
+        fun probe(name: String): Boolean = try {
+            val u: String
+            val h = HashMap<String, String>()
+            when (name) {
+                "Gemini" -> { u = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"; h["x-goog-api-key"] = k1 }
+                "Gemini 2" -> { u = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"; h["x-goog-api-key"] = k4 }
+                "Claude" -> { u = "https://api.anthropic.com/v1/models?limit=1"; h["x-api-key"] = k1; h["anthropic-version"] = "2023-06-01" }
+                "Groq" -> { u = "https://api.groq.com/openai/v1/models"; h["Authorization"] = "Bearer $k2" }
+                else -> { u = "https://openrouter.ai/api/v1/key"; h["Authorization"] = "Bearer $k3" }
+            }
+            val pc = URL(u).openConnection() as HttpURLConnection
+            for ((hk, hv) in h) pc.setRequestProperty(hk, hv)
+            pc.connectTimeout = 10000; pc.readTimeout = 10000
+            val pcode = pc.responseCode
+            pc.disconnect()
+            pcode < 500 && pcode != 408
+        } catch (e: Exception) { false }
         while (!stop) {
             val now = System.currentTimeMillis()
             val onl = online()
-            val prov = if (onl) chain.firstOrNull { (until[it.name] ?: 0L) <= now } else null
-            if (prov == null) {
+            // 1) serveurs qui ne répondaient pas : test toutes les minutes
+            if (onl) for (p in chain) {
+                if (down.contains(p.name) && now >= (probeAt[p.name] ?: 0L)) {
+                    if (probe(p.name)) {
+                        down.remove(p.name); until[p.name] = 0L; back.add(p.name); netFail[p.name] = 0
+                        synchronized(perr) { perr.remove(p.name) }
+                        pst(p.name, "de nouveau en ligne ✓ — on y retourne")
+                    } else {
+                        probeAt[p.name] = System.currentTimeMillis() + 60_000L
+                        pst(p.name, "toujours hors ligne — nouveau test dans 1 min")
+                    }
+                }
+            }
+            // 2) limites dont l'heure de remise à zéro est passée : retour automatique
+            for (p in chain) if (resetKnown.contains(p.name) && (until[p.name] ?: 0L) <= now) {
+                resetKnown.remove(p.name); back.add(p.name)
+                synchronized(pReset) { pReset.remove(p.name) }
+                pst(p.name, "limite remise à zéro ✓ — on y retourne")
+            }
+            val avail = chain.filter { (until[it.name] ?: 0L) <= now }
+            val curP = chain.firstOrNull { it.name == cur && (until[it.name] ?: 0L) <= now }
+            val sel: Prov? = if (!onl) null
+                else if (curP != null) (avail.firstOrNull { chain.indexOf(it) < chain.indexOf(curP) && back.contains(it.name) } ?: curP)
+                else avail.firstOrNull()
+            if (sel == null) {
                 val chunk = todo().take(150); if (chunk.isEmpty()) break
                 fellBack = true
                 if (!onl && !failNotes.contains("internet")) failNotes += "internet coupé "
@@ -902,6 +987,9 @@ class MainActivity : Activity() {
                 offlineTranslate(chunk)
                 continue
             }
+            val prov: Prov = sel
+            back.remove(prov.name)
+            if (prov.name != cur) { cur = prov.name; ui("Serveur : " + prov.name) }
             val b = todo().take(minOf(bsz[prov.name] ?: prov.batch, prov.batch)); if (b.isEmpty()) break
             val i = cues.indexOf(b[0])
             val ctx = cues.subList(maxOf(0, i - 8), i).filter { memo[it.zh] != null }
@@ -919,6 +1007,7 @@ class MainActivity : Activity() {
                 if (got < b.size) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) * 2 / 3)
                 synchronized(perr) { perr.remove(prov.name) }
                 pf[prov.name] = 0
+                netFail[prov.name] = 0
                 val msg = "Traduction ${cues.count { memo[it.zh] != null }} / ${cues.size} (${prov.name})"
                 ui(msg); notifyProgress(msg); saveState()
                 pst(prov.name, "ACTIF ✓ dernier lot : $got/${b.size} lignes")
@@ -928,7 +1017,7 @@ class MainActivity : Activity() {
                 if (stop) return
                 if (e is ParseErr && (pf[prov.name] ?: 0) < 3) {
                     pf[prov.name] = (pf[prov.name] ?: 0) + 1
-                    val cur = bsz[prov.name] ?: prov.batch
+                    val cur2 = bsz[prov.name] ?: prov.batch
                     synchronized(perr) { perr[prov.name] = "réponse illisible (ignorée, on continue)" }
                     if (b.size <= 3) {
                         pst(prov.name, "réponse illisible : ${b.size} ligne(s) traduite(s) hors ligne, on continue")
@@ -936,25 +1025,62 @@ class MainActivity : Activity() {
                         try { offlineTranslate(b) } catch (x: Exception) {}
                         bsz[prov.name] = minOf(prov.batch, 8)
                     } else {
-                        bsz[prov.name] = maxOf(3, cur / 2)
+                        bsz[prov.name] = maxOf(3, cur2 / 2)
                         pst(prov.name, "réponse illisible : nouvel essai avec un lot plus petit")
                     }
                     Thread.sleep(500)
                     continue
                 }
-                val code = if (e is ApiErr) e.code.toString() else "erreur"
-                val cool = when {
-                    e is ApiErr && (e.code == 401 || e.code == 403) -> 6 * 3600 * 1000L
-                    e is ApiErr && e.code == 429 -> 30 * 60 * 1000L
-                    else -> 3 * 60 * 1000L
-                }
-                until[prov.name] = System.currentTimeMillis() + cool
-                if (e !is ApiErr) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) / 2)
                 synchronized(perr) { perr[prov.name] = (e.message ?: e.toString()).replace(Regex("\\s+"), " ").take(160) }
-                failNotes += prov.name + " (" + code + ") "
-                pst(prov.name, "en pause ($code) — nouvel essai dans ${cool / 60000} min")
+                val ae = e as? ApiErr
+                val isLimit = ae != null && ae.code == 429
+                val isKey = ae != null && (ae.code == 401 || ae.code == 403)
+                val isDown = e is java.io.IOException || (ae != null && (ae.code >= 500 || ae.code == 408))
+                if (isDown && !online()) { activeName = ""; continue }
+                if (isDown) {
+                    // le serveur ne répond pas : 2e essai après 20 s, puis serveur suivant
+                    val nf = (netFail[prov.name] ?: 0) + 1
+                    netFail[prov.name] = nf
+                    if (nf < 2) {
+                        activeName = ""
+                        for (sec in 20 downTo 1) {
+                            if (stop) return
+                            pst(prov.name, "ne répond pas — nouvel essai dans $sec s")
+                            Thread.sleep(1000)
+                        }
+                        continue
+                    }
+                    netFail[prov.name] = 0
+                    down.add(prov.name); probeAt[prov.name] = System.currentTimeMillis() + 60_000L; until[prov.name] = far
+                    failNotes += prov.name + " (hors ligne) "
+                    pst(prov.name, "hors ligne — test automatique chaque minute")
+                    activeName = ""
+                    ui(prov.name + " ne répond pas : serveur suivant…")
+                    Thread.sleep(500)
+                    continue
+                }
+                val nowE = System.currentTimeMillis()
+                if (isLimit) {
+                    val r = ae!!.resetMs
+                    if (r > nowE && r - nowE < 36L * 3600 * 1000) {
+                        until[prov.name] = r + 2000L; resetKnown.add(prov.name)
+                        synchronized(pReset) { pReset[prov.name] = r + 2000L }
+                        pst(prov.name, "limite atteinte — reprise automatique dans ${fmtDur(r - nowE)} (vers ${hhmm(r)})")
+                    } else {
+                        until[prov.name] = nowE + 30 * 60 * 1000L
+                        pst(prov.name, "limite atteinte — heure de remise à zéro non fournie : on reste sur le serveur actuel")
+                    }
+                } else if (isKey) {
+                    until[prov.name] = nowE + 6 * 3600 * 1000L
+                    pst(prov.name, "clé refusée (${ae!!.code}) — serveur ignoré")
+                } else {
+                    until[prov.name] = nowE + 3 * 60 * 1000L
+                    pst(prov.name, "en pause — nouvel essai dans 3 min")
+                }
+                if (e !is ApiErr) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) / 2)
+                failNotes += prov.name + " (" + (if (ae != null) ae.code.toString() else "erreur") + ") "
                 activeName = ""
-                ui(prov.name + " en pause (" + code + ") : serveur suivant…")
+                ui(prov.name + " : serveur suivant…")
                 Thread.sleep(1000)
             }
         }
@@ -962,8 +1088,54 @@ class MainActivity : Activity() {
         chain.forEach { if ((until[it.name] ?: 0L) <= System.currentTimeMillis()) pst(it.name, "terminé") }
     }
 
+    private fun fmtDur(ms: Long): String {
+        val t = maxOf(0L, ms) / 1000
+        return when {
+            t >= 3600 -> "%d h %02d min".format(t / 3600, t % 3600 / 60)
+            t >= 60 -> "%d min %02d s".format(t / 60, t % 60)
+            else -> "$t s"
+        }
+    }
+
+    private fun hhmm(ms: Long): String = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(ms))
+
+    private fun nextPacificMidnight(now: Long): Long {
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("America/Los_Angeles"))
+        cal.timeInMillis = now
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0); cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0); cal.set(java.util.Calendar.MILLISECOND, 0)
+        cal.add(java.util.Calendar.DAY_OF_MONTH, 1)
+        return cal.timeInMillis
+    }
+
+    private fun parseDur(s: String): Long? {
+        val m = Regex("(?:(\\d+)h)?(?:(\\d+)m(?!s))?(?:([0-9.]+)s)?").matchEntire(s.trim()) ?: return null
+        if (m.groupValues.drop(1).all { it.isEmpty() }) return null
+        val h = m.groupValues[1].toLongOrNull() ?: 0L
+        val mi = m.groupValues[2].toLongOrNull() ?: 0L
+        val se = m.groupValues[3].toDoubleOrNull() ?: 0.0
+        return ((h * 3600 + mi * 60) * 1000 + se * 1000).toLong()
+    }
+
+    /** Heure (en ms) à laquelle la limite sera remise à zéro, si le serveur la fournit ; -1 sinon. */
+    private fun resetFrom(url: String, c: HttpURLConnection, body: String): Long {
+        val now = System.currentTimeMillis()
+        try {
+            if (provOf(url).startsWith("Gemini")) {
+                if (body.contains("PerDay", true) || body.contains("per day", true)) return nextPacificMidnight(now)
+                Regex("\"retryDelay\"\\s*:\\s*\"([0-9.]+)s\"").find(body)?.let { return now + (it.groupValues[1].toDouble() * 1000).toLong() }
+            }
+            c.getHeaderField("retry-after")?.trim()?.toDoubleOrNull()?.let { return now + (it * 1000).toLong() }
+            c.getHeaderField("x-ratelimit-reset-requests")?.let { r -> parseDur(r)?.let { d -> return now + d } }
+            val h = c.getHeaderField("X-RateLimit-Reset")
+                ?: Regex("(?i)x-ratelimit-reset\"?\\s*[:=]\\s*\"?(\\d{10,13})").find(body)?.groupValues?.get(1)
+            h?.toLongOrNull()?.let { v -> val ms = if (v < 100000000000L) v * 1000 else v; if (ms > now) return ms }
+        } catch (e: Exception) {}
+        return -1L
+    }
+
     private fun provOf(url: String) = when {
-        url.contains("generativelanguage") -> "Gemini"
+        url.contains("generativelanguage") -> geminiName
         url.contains("groq") -> "Groq"
         url.contains("openrouter") -> "OpenRouter"
         else -> "Claude"
@@ -1069,14 +1241,15 @@ class MainActivity : Activity() {
                 val txt = post("$base/chat/completions", mapOf("Authorization" to "Bearer $key"), body)
                 val msg = JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
                 val out = msg.optString("content", "")
-                if (out.isBlank() || out == "null") throw Exception("réponse vide ($model)")
+                if (out.isBlank() || out == "null") throw ParseErr("réponse vide ($model)")
                 return parse(out, b.size)
             } catch (e: Exception) {
                 if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
                 if (e is ParseErr && a >= 2) throw e
+                if (e is java.io.IOException) throw e
                 if (e !is ApiErr && !online()) throw e
-                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 4L else 2L
+                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) 2L else 2L
                 val c = if (e is ApiErr) e.code.toString() else "erreur"
                 pst(name, "essai $a/4 échoué ($c) : autre modèle dans $wait s")
                 Thread.sleep(wait * 1000)
@@ -1174,7 +1347,7 @@ class MainActivity : Activity() {
         val code = c.responseCode
         quotaFrom(url, c)
         val txt = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
-        if (code >= 400) throw ApiErr(code, txt)
+        if (code >= 400) { val ex = ApiErr(code, txt); ex.resetMs = resetFrom(url, c, txt); throw ex }
         return txt
     }
 
@@ -1186,12 +1359,16 @@ class MainActivity : Activity() {
             try {
                 val txt = post("https://api.anthropic.com/v1/messages", mapOf("x-api-key" to key, "anthropic-version" to "2023-06-01"), body)
                 return parse(JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text"), b.size)
-            } catch (e: Exception) { err = e; Thread.sleep(4000L * a) }
+            } catch (e: Exception) {
+                err = e
+                if (e is java.io.IOException || (e is ApiErr && (e.code == 401 || e.code == 403 || e.code == 429))) throw e
+                Thread.sleep(4000L * a)
+            }
         }
         throw err!!
     }
 
-    private fun gemini(key: String, ctx: List<Cue>, b: List<Cue>, tries: Int = 12): List<String> {
+    private fun gemini(key: String, ctx: List<Cue>, b: List<Cue>, tries: Int = 12, name: String = "Gemini"): List<String> {
         val body = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt(ctx, b))))))
             .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0.3))
@@ -1199,25 +1376,22 @@ class MainActivity : Activity() {
         for (a in 1..tries) {
             try {
                 val model = if (a % 2 == 1) "gemini-flash-latest" else "gemini-flash-lite-latest"
-                synchronized(pmodel) { pmodel["Gemini"] = model }
+                synchronized(pmodel) { pmodel[name] = model }
                 val txt = post("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent", mapOf("x-goog-api-key" to key), body)
                 val cands = JSONObject(txt).optJSONArray("candidates")
-                if (cands == null || cands.length() == 0) throw Exception("Gemini : réponse vide ou bloquée " + txt.replace(Regex("\\s+"), " ").take(100))
+                if (cands == null || cands.length() == 0) throw ParseErr("Gemini : réponse vide ou bloquée " + txt.replace(Regex("\\s+"), " ").take(100))
                 val out = cands.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text", "") ?: ""
-                if (out.isBlank()) throw Exception("Gemini : texte vide (fin : " + cands.getJSONObject(0).optString("finishReason", "?") + ")")
+                if (out.isBlank()) throw ParseErr("Gemini : texte vide (fin : " + cands.getJSONObject(0).optString("finishReason", "?") + ")")
                 val r = parse(out, b.size)
                 Thread.sleep(5000)
                 return r
             } catch (e: Exception) {
                 if (e is ApiErr && (e.code == 401 || e.code == 403)) throw e
                 err = e
-                if (e is ParseErr && a >= 2) throw e
-                if (e is ApiErr && e.code == 429 && a >= minOf(6, tries)) break
-                if (e !is ApiErr && !online()) throw e
-                val wait = if (e is ApiErr && (e.code == 429 || e.code >= 500)) minOf(300L, 20L * a) else 4L * a
-                ui("Gemini occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s…")
-                pst("Gemini", "occupé (" + (if (e is ApiErr) e.code.toString() else "réseau") + ") : nouvel essai dans " + wait + " s")
-                Thread.sleep(wait * 1000)
+                if (e is java.io.IOException) throw e
+                // 1er essai raté (limite, 5xx, réponse vide…) : on tente tout de suite l'autre modèle ;
+                // si ça rate aussi, la boucle principale décide (nouvel essai dans 20 s, puis serveur suivant)
+                if (a >= 2) throw e
             }
         }
         throw err!!
@@ -1457,6 +1631,29 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    /** Avant chaque traduction : les mots fréquents de la vidéo sont traduits et ajoutés tout seuls au glossaire. */
+    private fun autoGlossary(k1: String, k2: String, k3: String) {
+        autoGlN = 0
+        if (srcIsEn || cues.isEmpty() || stop) return
+        if (!online() || (k1.isEmpty() && k2.isEmpty() && k3.isEmpty())) return
+        try {
+            phase = "analyse"; phaseInfo = "Glossaire automatique : recherche des mots fréquents…"
+            ui(phaseInfo); runOnUiThread { renderPanel() }
+            val snap = cues.map { it.start to it.zh }
+            val words = detectTerms(snap).filter { it.second >= 5 }.take(40).map { it.first }
+            if (words.isEmpty()) return
+            val ex = HashMap<String, String>()
+            for (w in words) snap.firstOrNull { it.second.contains(w) }?.let { ex[w] = it.second.take(50) }
+            phaseInfo = "Glossaire automatique : traduction de ${words.size} mots…"
+            ui(phaseInfo); runOnUiThread { renderPanel() }
+            val m = translateTerms(k1, k2, k3, words, ex, false)
+            var n = 0
+            for ((w, t) in m) if (!userGl.containsKey(w) && !glossary.containsKey(w)) { userGl[w] = t; n++ }
+            if (n > 0) saveGl()
+            autoGlN = n
+        } catch (e: Exception) {}
+    }
+
     private fun addTranslated(words: List<String>, snap: List<Pair<Double, String>>) {
         val k1 = key.text.toString().trim(); val k2 = key2.text.toString().trim(); val k3 = key3.text.toString().trim()
         Toast.makeText(this, "Traduction de ${words.size} mots…", Toast.LENGTH_LONG).show()
@@ -1478,7 +1675,7 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun translateTerms(k1: String, k2: String, k3: String, words: List<String>, ex: Map<String, String>): Map<String, String> {
+    private fun translateTerms(k1: String, k2: String, k3: String, words: List<String>, ex: Map<String, String>, allowOffline: Boolean = true): Map<String, String> {
         val obj = JSONObject(); words.forEach { obj.put(it, ex[it] ?: "") }
         val p = "Ce sont des mots ou expressions chinois fréquents dans un manhua (clé = le mot, valeur = une ligne d’exemple où il apparaît). " +
             "Traduis chaque mot en arabe standard moderne : transcris phonétiquement en arabe les noms de personnes et de lieux, traduis les termes et les titres. " +
@@ -1503,7 +1700,7 @@ class MainActivity : Activity() {
                 if (words.contains(k) && v.isNotEmpty() && v != k) res[k] = v
             }
         }
-        if (res.isEmpty()) {
+        if (res.isEmpty() && allowOffline) {
             // aucun serveur n'a répondu : traduction hors ligne mot à mot (moins bonne, à vérifier)
             try {
                 val tr = Translation.getClient(TranslatorOptions.Builder()
@@ -1517,6 +1714,7 @@ class MainActivity : Activity() {
     }
 
     private fun askGemini(key: String, text: String): String {
+        geminiName = "Gemini"
         val body = JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text)))))
             .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0.2))
@@ -1600,7 +1798,7 @@ class MainActivity : Activity() {
     private fun translateSrtFile(u: Uri) {
         if (running) return
         val k = key.text.toString().trim(); val k2 = key2.text.toString().trim(); val k3 = key3.text.toString().trim()
-        getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply()
+        getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply(); k4 = key4.text.toString().trim(); getSharedPreferences("p", 0).edit().putString("k4", k4).apply()
         val name = nameOf(u)
         val outBase = name.substringBeforeLast('.')
         running = true; stop = false; srtMode = true; goB.isEnabled = false; lastOk = false; phase = ""; retraSet.clear()
@@ -1621,6 +1819,7 @@ class MainActivity : Activity() {
                 srtKey = abs(u.toString().hashCode()).toString()
                 loadSrtState()
                 ui("Fichier lu : ${cues.size} sous-titres ($srcLang → arabe). Traduction…")
+                autoGlossary(k, k2, k3)
                 translateAll(k, k2, k3)
                 if (stop) { saveState(); ui("Arrêté. Relance le même fichier pour reprendre."); return@Thread }
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
