@@ -29,4 +29,6 @@ android {
 dependencies {
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     implementation("com.google.mlkit:translate:17.0.3")
+implementation("com.alphacephei:vosk-android:0.3.47")
+implementation("net.java.dev.jna:jna:5.13.0@aar")
 }
