@@ -60,7 +60,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.abs
 
-class Cue(var start: Double, var end: Double, var zh: String, var ar: String = "")
+class Cue(var start: Double, var end: Double, var zh: String, var ar: String = "") { var hint: String = "" }
 
 class Prov(val name: String, val batch: Int, val pause: Long, val call: (List<Cue>, List<Cue>) -> List<String>)
 
@@ -129,6 +129,13 @@ class MainActivity : Activity() {
     private val pmodel = LinkedHashMap<String, String>()
     private val perr = LinkedHashMap<String, String>()
     private val retraSet = HashSet<String>()
+    private val asr = ArrayList<Seg>()
+    private var asrDone = 0.0
+    private val zhFix = HashMap<String, String>()
+    @Volatile private var useAsr = false
+    @Volatile private var asrNote = ""
+    @Volatile private var lastFix = HashMap<Int, String>()
+    private lateinit var cbAsr: CheckBox
     @Volatile private var phase = ""
     @Volatile private var phaseInfo = ""
     @Volatile private var lastOk = false
@@ -209,6 +216,11 @@ class MainActivity : Activity() {
         etFrom = EditText(this).apply { hint = "Début de l’analyse (minutes)"; setText("0"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
         etTo = EditText(this).apply { hint = "Fin (minutes, 0 = toute la vidéo)"; setText("5"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
         col.addView(etFrom); col.addView(etTo)
+        cbAsr = CheckBox(this).apply {
+            text = "Comparer avec l’audio chinois (reconnaissance vocale hors ligne, modèle ≈ 40 Mo, plus lent)"
+            isChecked = getSharedPreferences("p", 0).getBoolean("asr", false)
+        }
+        col.addView(cbAsr)
         col.addView(btn("Choisir le dossier de sortie (celui de la vidéo)") {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 2)
         })
@@ -232,7 +244,7 @@ class MainActivity : Activity() {
                 null
             ) {
                 backupState()
-                memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); saveState(); playB.isEnabled = false
+                memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); zhFix.clear(); saveState(); playB.isEnabled = false
                 st.text = "Traductions effacées. Appuie sur « 2 » pour retraduire avec ton glossaire."
             }
         })
@@ -265,6 +277,7 @@ class MainActivity : Activity() {
             ) {
                 backupState()
                 items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); done = 0.0; cues = listOf()
+                asr.clear(); asrDone = 0.0; zhFix.clear()
                 sf().delete()
                 playB.isEnabled = false
                 st.text = "Progression effacée. Une copie de secours existe : « Restaurer »."
@@ -516,12 +529,15 @@ class MainActivity : Activity() {
         val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot).put("rs", savedStart)
         o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
         o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList())).put("src", JSONObject(srcMap.toMap())).put("ret", JSONArray(retraSet.toList()))
+        o.put("ad", asrDone).put("zf", JSONObject(zhFix.toMap()))
+        o.put("asr", JSONArray().also { a -> synchronized(asr) { asr.forEach { sg -> a.put(JSONArray().put(sg.start).put(sg.end).put(sg.text)) } } })
         sf().writeText(o.toString())
         saveGl()
     }
 
     private fun loadState() {
         items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
+        asr.clear(); asrDone = 0.0; zhFix.clear()
         val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
         done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
@@ -531,6 +547,9 @@ class MainActivity : Activity() {
         offlineKeys.clear(); o.optJSONArray("off")?.let { a -> for (i in 0 until a.length()) offlineKeys.add(a.getString(i)) }
         o.optJSONObject("src")?.let { s2 -> s2.keys().forEach { srcMap[it] = s2.getString(it) } }
         o.optJSONArray("ret")?.let { a -> for (i in 0 until a.length()) retraSet.add(a.getString(i)) }
+        asrDone = o.optDouble("ad", 0.0)
+        o.optJSONObject("zf")?.let { z -> z.keys().forEach { zhFix[it] = z.getString(it) } }
+        o.optJSONArray("asr")?.let { a -> for (i in 0 until a.length()) { val x = a.getJSONArray(i); asr.add(Seg(x.getDouble(0), x.getDouble(1), x.getString(2))) } }
         if (items.isNotEmpty()) { cues = buildCues(); cues.forEach { it.ar = memo[it.zh] ?: "" } }
     }
 
@@ -592,8 +611,12 @@ class MainActivity : Activity() {
         val reRaw = (etTo.text.toString().toDoubleOrNull() ?: 0.0) * 60
         val re = if (reRaw <= 0.0 || reRaw > full) full else reRaw
         if (re <= rs) { st.text = "La fin doit être après le début."; return }
+        useAsr = cbAsr.isChecked
+        getSharedPreferences("p", 0).edit().putBoolean("asr", useAsr).apply()
+        if (savedStart != rs) { asr.clear(); asrDone = 0.0 }
         if (savedTop != ct || savedBot != cb || savedStart != rs) { items.clear(); done = 0.0 }
         done = maxOf(done, rs)
+        asrDone = maxOf(asrDone, rs)
         savedTop = ct; savedBot = cb; savedStart = rs; rEnd = re
         running = true; stop = false; goB.isEnabled = false; lastOk = false; phase = ""
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -629,8 +652,10 @@ class MainActivity : Activity() {
                     }
                     r.release(); saveState()
                 }
+                if (useAsr && !stop) runAsr(re)
                 if (stop) { ui("Arrêté. Relance l’analyse pour reprendre."); return@Thread }
                 cues = buildCues()
+                attachHints(cues)
                 if (cues.isEmpty()) { ui("Aucun sous-titre détecté : vérifie la zone rouge."); return@Thread }
                 ui("${cues.size} sous-titres. Traduction…")
                 translateAll(k, k2, k3)
@@ -639,8 +664,9 @@ class MainActivity : Activity() {
                 saveState()
                 val inTree = exportAll()
                 val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
+                val fixNote = if (useAsr) (" Audio : ${asr.size} phrases, ${cues.count { zhFix.containsKey(it.zh) }} lignes de chinois corrigées." + (if (asr.isNotEmpty()) " Fichier $base.audio.srt = audio brut." else "") + asrNote) else ""
                 val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
-                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
+                ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote$fixNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
                 lastOk = true
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
@@ -653,6 +679,73 @@ class MainActivity : Activity() {
                 runOnUiThread { goB.isEnabled = true; window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); renderPanel() }
             }
         }.start()
+    }
+
+    private fun zhOf(c: Cue): String = zhFix[c.zh] ?: c.zh
+
+    private fun okFix(orig: String, z: String): Boolean {
+        val a = norm(orig); val b = norm(z)
+        if (b.isEmpty() || a == b) return false
+        if (!Regex("[\\u4e00-\\u9fff]").containsMatchIn(b)) return false
+        return b.length >= a.length * 0.5 && b.length <= a.length * 1.6 + 2
+    }
+
+    private fun cover(a: String, b: String): Double {
+        if (a.length < 2) return if (a.isNotEmpty() && b.contains(a)) 1.0 else 0.0
+        var c = 0
+        for (i in 0 until a.length - 1) if (b.contains(a.substring(i, i + 2))) c++
+        return c.toDouble() / (a.length - 1)
+    }
+
+    private fun runAsr(to: Double) {
+        val u = uri ?: return
+        asrNote = ""
+        if (asrDone >= to) return
+        try {
+            phase = "analyse"
+            val md = Asr.ensureModel(this, { m -> phaseInfo = m; ui(m); runOnUiThread { renderPanel() } }, { stop })
+            if (stop) return
+            var ls = System.currentTimeMillis()
+            Asr.transcribe(this, u, md, asrDone, to,
+                { sg -> synchronized(asr) { asr.add(sg) } },
+                { t ->
+                    asrDone = maxOf(asrDone, t)
+                    phaseInfo = "Audio ${hms(t)} / ${hms(to)} · ${asr.size} phrases"; phase = "analyse"
+                    ui(phaseInfo); runOnUiThread { renderPanel() }
+                    if (System.currentTimeMillis() - ls > 20000) { saveState(); ls = System.currentTimeMillis(); notifyProgress("Audio ${hms(t)} / ${hms(to)}") }
+                },
+                { stop })
+            if (!stop) asrDone = to
+            saveState()
+        } catch (e: Exception) {
+            asrNote = " Audio ignoré (" + (e.message ?: e.toString()).replace(Regex("\\s+"), " ").take(90) + ")."
+            try { saveState() } catch (x: Exception) {}
+        }
+    }
+
+    private fun attachHints(list: List<Cue>) {
+        val segs = synchronized(asr) { asr.sortedBy { it.start } }
+        var lo = 0
+        for (c in list) {
+            c.hint = ""
+            if (!useAsr || segs.isEmpty()) continue
+            val a = c.start - 1.0; val b = c.end + 1.0
+            while (lo < segs.size && segs[lo].end < a) lo++
+            val sb = StringBuilder()
+            var i = lo
+            while (i < segs.size && segs[i].start <= b) { if (segs[i].end >= a) sb.append(segs[i].text); i++ }
+            val h = sb.toString()
+            if (h.isEmpty()) continue
+            if (cover(norm(c.zh), norm(h)) >= 0.7) continue
+            c.hint = h.take(120)
+        }
+    }
+
+    private fun audioSrt(): String {
+        val segs = synchronized(asr) { asr.sortedBy { it.start } }
+        return segs.withIndex().joinToString("\n") { (i, sg) ->
+            "${i + 1}\n${ts(sg.start)} --> ${ts(maxOf(sg.end, sg.start + 0.5))}\n${sg.text}\n"
+        }
     }
 
     private fun offlineTranslate(list: List<Cue>) {
@@ -816,10 +909,11 @@ class MainActivity : Activity() {
             pst(prov.name, "ACTIF — traduit un lot de ${b.size} lignes…")
             try {
                 val res = prov.call(ctx, b)
+                val fx = lastFix
                 var got = 0
                 b.forEachIndexed { j, c ->
                     val r = if (j < res.size) res[j] else ""
-                    if (r.isNotBlank()) { memo[c.zh] = r; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name); got++; learnPhrase(c.zh, r) }
+                    if (r.isNotBlank()) { memo[c.zh] = r; offlineKeys.remove(c.zh); srcMap[c.zh] = codeOf(prov.name); got++; learnPhrase(c.zh, r); fx[j]?.let { z -> if (okFix(c.zh, z)) zhFix[c.zh] = z } }
                 }
                 if (got == 0) throw Exception("aucune ligne exploitable dans la réponse")
                 if (got < b.size) bsz[prov.name] = maxOf(5, (bsz[prov.name] ?: prov.batch) * 2 / 3)
@@ -1003,15 +1097,23 @@ class MainActivity : Activity() {
         p.append("Ne résume pas, ne commente pas.\n\nGlossaire à respecter exactement : ").append(JSONObject(rel.toMap())).append("\n\n")
         if (ctx.isNotEmpty()) {
             p.append("Contexte déjà traduit (ne pas retraduire) :\n")
-            ctx.forEach { p.append(it.zh).append(" => ").append(memo[it.zh]).append("\n") }
+            ctx.forEach { p.append(zhOf(it)).append(" => ").append(memo[it.zh]).append("\n") }
             p.append("\n")
         }
         val numbered = JSONObject(); b.forEachIndexed { i, c -> numbered.put((i + 1).toString(), clean(c.zh)) }
         p.append("Lignes à traduire (objet JSON numéroté) :\n").append(numbered).append("\n\n")
+        val hints = JSONObject(); b.forEachIndexed { i, c -> if (c.hint.isNotEmpty()) hints.put((i + 1).toString(), c.hint) }
+        val withAudio = hints.length() > 0
+        if (withAudio) {
+            p.append("Transcription AUDIO automatique de certaines lignes (mêmes numéros) : ").append(hints).append("\n")
+            p.append("Le texte à l’écran (OCR) peut contenir des caractères faux (formes proches). L’audio vient d’une reconnaissance vocale sans ponctuation : il peut contenir des mots faux (même prononciation) ou des paroles absentes de l’écran. ")
+            p.append("Compare : si l’OCR est incohérent ou douteux et que l’audio donne une phrase plausible de prononciation ou de sens proche, corrige le chinois ; sinon garde l’OCR tel quel. N’invente rien. Traduis la version corrigée.\n\n")
+        }
         p.append("Réponds uniquement par un objet JSON {\"t\":{\"1\":\"traduction arabe de la ligne 1\",\"2\":\"...\"},\"g\":{\"nom chinois\":\"nom arabe\"}} ; ")
         p.append("t contient exactement une entrée par numéro, avec les mêmes numéros (${b.size} lignes). ")
         p.append("g ne contient que les NOUVEAUX noms propres ou termes clés. ")
         p.append("Dans les traductions, n’utilise jamais le guillemet droit \" : utilise « » à la place. Le JSON doit être complet et valide.")
+        if (withAudio) p.append(" Ajoute aussi la clé z : {\"numéro\":\"chinois corrigé\"} avec UNIQUEMENT les lignes dont tu as corrigé le chinois (objet vide si aucune).")
         return p.toString()
     }
 
@@ -1028,6 +1130,8 @@ class MainActivity : Activity() {
     private fun parse(raw: String, n: Int): List<String> {
         val out = raw.replace(Regex("(?s)<think>.*?</think>"), "").replace("```json", "").replace("```", "")
         val res = MutableList(n) { "" }
+        val fx = HashMap<Int, String>()
+        lastFix = fx
         var ok = false
         try {
             val a = out.indexOf('{'); val z = out.lastIndexOf('}')
@@ -1042,6 +1146,7 @@ class MainActivity : Activity() {
                     ok = true
                 }
                 j.optJSONObject("g")?.let { g -> g.keys().forEach { addTerm(it, g.optString(it, "")) } }
+                j.optJSONObject("z")?.let { z -> for (i in 1..n) { val v = z.optString(i.toString(), ""); if (v.isNotBlank() && v != "null") fx[i - 1] = v } }
             }
         } catch (e: Exception) { ok = false }
         if (!ok) {
@@ -1570,8 +1675,9 @@ class MainActivity : Activity() {
         if (tree != null) {
             try {
                 putTree(tree, "$base.srt", srt { it.ar })
-                putTree(tree, "$base.zh.srt", srt { it.zh })
-                putTree(tree, "$base.bilingue.srt", srt { it.zh + "\n" + it.ar })
+                putTree(tree, "$base.zh.srt", srt { zhOf(it) })
+                putTree(tree, "$base.bilingue.srt", srt { zhOf(it) + "\n" + it.ar })
+                if (useAsr && asr.isNotEmpty()) putTree(tree, "$base.audio.srt", audioSrt())
                 return true
             } catch (e: Exception) {}
         }
@@ -1584,8 +1690,9 @@ class MainActivity : Activity() {
             contentResolver.openOutputStream(u)!!.use { it.write(("\uFEFF" + text).toByteArray()) }
         }
         put("$base.ar.srt", srt { it.ar })
-        put("$base.zh.srt", srt { it.zh })
-        put("$base.bilingue.srt", srt { it.zh + "\n" + it.ar })
+        put("$base.zh.srt", srt { zhOf(it) })
+        put("$base.bilingue.srt", srt { zhOf(it) + "\n" + it.ar })
+        if (useAsr && asr.isNotEmpty()) put("$base.audio.srt", audioSrt())
         return false
     }
 
@@ -1600,7 +1707,7 @@ class MainActivity : Activity() {
                 if (box.visibility != View.VISIBLE) return
                 val t = vv.currentPosition / 1000.0
                 val c = cues.firstOrNull { t >= it.start && t < it.end }
-                ov.text = when { c == null -> ""; mode == 0 -> c.ar; mode == 2 -> c.zh; else -> c.zh + "\n" + c.ar }
+                ov.text = when { c == null -> ""; mode == 0 -> c.ar; mode == 2 -> zhOf(c); else -> zhOf(c) + "\n" + c.ar }
                 ov.visibility = if (c == null) View.INVISIBLE else View.VISIBLE
                 h.postDelayed(this, 250)
             }
