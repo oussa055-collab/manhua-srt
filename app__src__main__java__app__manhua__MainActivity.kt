@@ -228,8 +228,8 @@ class MainActivity : Activity() {
             setText(getSharedPreferences("p", 0).getString("ko", ""))
         }
         col.addView(key2); col.addView(key3)
-        etFrom = EditText(this).apply { hint = "Début de l’analyse (minutes)"; setText("0"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
-        etTo = EditText(this).apply { hint = "Fin (minutes, 0 = toute la vidéo)"; setText("5"); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+        etFrom = EditText(this).apply { hint = "Début : minutes, ou h:mm (ex. 4:00). Avec « - » = depuis la fin (-2:00 = 2 dernières heures)"; setText("0"); inputType = InputType.TYPE_CLASS_TEXT }
+        etTo = EditText(this).apply { hint = "Fin : minutes ou h:mm (0 = jusqu’à la fin de la vidéo)"; setText("5"); inputType = InputType.TYPE_CLASS_TEXT }
         col.addView(etFrom); col.addView(etTo)
         cbAsr = CheckBox(this).apply {
             text = "Comparer avec l’audio chinois (reconnaissance vocale hors ligne, modèle ≈ 40 Mo, plus lent)"
@@ -362,7 +362,7 @@ class MainActivity : Activity() {
         try {
             b.copyTo(sf(), overwrite = true)
             loadState()
-            if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText((savedStart / 60).toString()) }
+            if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText(hms(savedStart)) }
             playB.isEnabled = cues.isNotEmpty() && cues.all { it.ar.isNotEmpty() }
             st.text = "Progression restaurée : analyse ${hms(done)}, ${memo.size} lignes traduites."
         } catch (e: Exception) { st.text = "Restauration impossible : ${e.message}" }
@@ -513,7 +513,7 @@ class MainActivity : Activity() {
                 r.release()
                 try { loadState() } catch (e: Exception) { items.clear(); memo.clear(); done = 0.0 }
                 runOnUiThread {
-                    if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText((savedStart / 60).toString()) }
+                    if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText(hms(savedStart)) }
                     drawPreview(); renderPanel(); goB.isEnabled = true
                     playB.isEnabled = cues.isNotEmpty() && cues.all { it.ar.isNotEmpty() }
                     st.text = "Durée ${hms(durMs / 1000.0)}." + if (items.isNotEmpty()) " Progression retrouvée : ${hms(done)}." else " Ajuste la zone rouge puis lance l’analyse."
@@ -618,6 +618,24 @@ class MainActivity : Activity() {
         return out
     }
 
+    // Accepte : 90 (minutes) · 1:30 (h:mm) · 1:30:15 (h:mm:ss) · -2:00 ou -120 (depuis la fin de la vidéo)
+    private fun parseTime(raw: String, full: Double): Double? {
+        var t = raw.trim().replace(',', '.').replace('：', ':')
+        if (t.isEmpty()) return null
+        val neg = t.startsWith("-")
+        if (neg) t = t.substring(1).trim()
+        val p = t.split(":")
+        val v: Double = try {
+            when (p.size) {
+                1 -> p[0].toDouble() * 60
+                2 -> p[0].toDouble() * 3600 + p[1].toDouble() * 60
+                3 -> p[0].toDouble() * 3600 + p[1].toDouble() * 60 + p[2].toDouble()
+                else -> return null
+            }
+        } catch (e: Exception) { return null }
+        return if (neg) (full - v).coerceAtLeast(0.0) else v
+    }
+
     private fun start() {
         if (running || uri == null) return
         val k = key.text.toString().trim()
@@ -626,8 +644,8 @@ class MainActivity : Activity() {
         getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply(); k4 = key4.text.toString().trim(); getSharedPreferences("p", 0).edit().putString("k4", k4).apply()
         val ct = sTop.progress; val cb = sBot.progress
         val full = durMs / 1000.0
-        val rs = ((etFrom.text.toString().toDoubleOrNull() ?: 0.0) * 60).coerceAtLeast(0.0)
-        val reRaw = (etTo.text.toString().toDoubleOrNull() ?: 0.0) * 60
+        val rs = (parseTime(etFrom.text.toString(), full) ?: 0.0).coerceIn(0.0, full)
+        val reRaw = parseTime(etTo.text.toString(), full) ?: 0.0
         val re = if (reRaw <= 0.0 || reRaw > full) full else reRaw
         if (re <= rs) { st.text = "La fin doit être après le début."; return }
         useAsr = cbAsr.isChecked
