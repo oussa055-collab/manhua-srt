@@ -106,7 +106,7 @@ class MainActivity : Activity() {
     private var base = "video"
     private var durMs = 0L
     private val items = mutableListOf<Pair<Double, String>>()
-    private val memo = HashMap<String, String>()
+    private val memo = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val glossary = LinkedHashMap<String, String>()
     private val phrases = LinkedHashMap<String, String>()
     @Volatile private var phDirty = false
@@ -122,8 +122,8 @@ class MainActivity : Activity() {
     private var savedStart = 0.0
     @Volatile private var fellBack = false
     @Volatile private var failNotes = ""
-    private val offlineKeys = HashSet<String>()
-    private val srcMap = HashMap<String, String>()
+    private val offlineKeys: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val srcMap = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val pstate = LinkedHashMap<String, String>()
     private val pquota = LinkedHashMap<String, String>()
     private val pmodel = LinkedHashMap<String, String>()
@@ -145,6 +145,7 @@ class MainActivity : Activity() {
     @Volatile private var asrNote = ""
     @Volatile private var lastFix = HashMap<Int, String>()
     private lateinit var cbAsr: CheckBox
+    private lateinit var cbPipe: CheckBox
     @Volatile private var phase = ""
     @Volatile private var phaseInfo = ""
     @Volatile private var lastOk = false
@@ -236,6 +237,11 @@ class MainActivity : Activity() {
             isChecked = getSharedPreferences("p", 0).getBoolean("asr", false)
         }
         col.addView(cbAsr)
+        cbPipe = CheckBox(this).apply {
+            text = "Traduire pendant l’analyse (plus rapide ; désactivé si la comparaison audio est cochée)"
+            isChecked = getSharedPreferences("p", 0).getBoolean("pipe", true)
+        }
+        col.addView(cbPipe)
         col.addView(btn("Choisir le dossier de sortie (celui de la vidéo)") {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 2)
         })
@@ -604,12 +610,12 @@ class MainActivity : Activity() {
         return if (Regex("[\\u4e00-\\u9fff]").containsMatchIn(s)) s else ""
     }
 
-    private fun buildCues(): List<Cue> {
+    private fun buildCues(src: List<Pair<Double, String>> = items): List<Cue> {
         val out = mutableListOf<Cue>(); val hh = STEP / 2; val dur = if (rEnd > 0) rEnd else durMs / 1000.0
-        for (k in items.indices) {
-            val (t, zh) = items[k]; if (zh.isEmpty()) continue
+        for (k in src.indices) {
+            val (t, zh) = src[k]; if (zh.isEmpty()) continue
             val s0 = maxOf(0.0, t - hh)
-            val e0 = maxOf((if (k + 1 < items.size) items[k + 1].first else minOf(dur, t + 3)) - hh, s0 + 0.5)
+            val e0 = maxOf((if (k + 1 < src.size) src[k + 1].first else minOf(dur, t + 3)) - hh, s0 + 0.5)
             val l = out.lastOrNull()
             if (l != null && abs(l.end - s0) < 0.01 && sim(norm(l.zh), norm(zh)) > 0.85) {
                 l.end = e0; if (zh.length > l.zh.length) l.zh = zh
@@ -649,6 +655,8 @@ class MainActivity : Activity() {
         val re = if (reRaw <= 0.0 || reRaw > full) full else reRaw
         if (re <= rs) { st.text = "La fin doit être après le début."; return }
         useAsr = cbAsr.isChecked
+        val pipe = cbPipe.isChecked && !useAsr
+        getSharedPreferences("p", 0).edit().putBoolean("pipe", cbPipe.isChecked).apply()
         getSharedPreferences("p", 0).edit().putBoolean("asr", useAsr).apply()
         if (savedStart != rs) { asr.clear(); asrDone = 0.0 }
         if (savedTop != ct || savedBot != cb || savedStart != rs) { items.clear(); done = 0.0 }
@@ -670,6 +678,8 @@ class MainActivity : Activity() {
                     var prev: IntArray? = null
                     var t = done
                     var ls = System.currentTimeMillis()
+                    var trThread: Thread? = null
+                    var lastPipe = items.size
                     while (t < dur && !stop) {
                         val f = r.getFrameAtTime((t * 1_000_000).toLong(), MediaMetadataRetriever.OPTION_CLOSEST)
                         if (f != null) {
@@ -683,11 +693,19 @@ class MainActivity : Activity() {
                             f.recycle()
                         }
                         t += STEP; done = t
+                        if (pipe && items.size - lastPipe >= 40 && trThread?.isAlive != true) {
+                            lastPipe = items.size
+                            val snap = items.toList().dropLast(1)
+                            trThread = Thread {
+                                try { cues = buildCues(snap); translateAll(k, k2, k3) } catch (e: Exception) {}
+                            }.also { it.start() }
+                        }
                         if (System.currentTimeMillis() - ls > 20000) { saveState(); ls = System.currentTimeMillis(); notifyProgress("Analyse ${hms(t)} / ${hms(dur)}") }
                         phaseInfo = "Analyse ${hms(t)} / ${hms(dur)} · ${items.size} changements"; phase = "analyse"
                         ui(phaseInfo); runOnUiThread { renderPanel() }
                     }
                     r.release(); saveState()
+                    while (trThread?.isAlive == true) { ui("Fin de la traduction du bloc en cours…"); Thread.sleep(500) }
                 }
                 if (useAsr && !stop) runAsr(re)
                 if (stop) { ui("Arrêté. Relance l’analyse pour reprendre."); return@Thread }
