@@ -115,21 +115,7 @@ class MainActivity : Activity() {
     private lateinit var addZh: EditText
     private lateinit var addAr: EditText
     private val userGl = LinkedHashMap<String, String>()
-    @Volatile private var cues = listOf<Cue>()
-    @Volatile private var trDone = 0
-    private lateinit var bkTv: TextView
-    private val bkBusy = java.util.concurrent.atomic.AtomicBoolean(false)
-    @Volatile private var lastBk = 0L
-    private val bkExec = java.util.concurrent.Executors.newSingleThreadExecutor()
-    @Volatile private var trQueued = 0
-    private val tUntil = HashMap<String, Long>()
-    private val tBsz = HashMap<String, Int>()
-    private val tPf = HashMap<String, Int>()
-    private val tNetFail = HashMap<String, Int>()
-    private val tDown = HashSet<String>()
-    private val tProbeAt = HashMap<String, Long>()
-    private val tResetKnown = HashSet<String>()
-    private val tBack = HashSet<String>()
+    private var cues = listOf<Cue>()
     private var done = 0.0
     private var savedTop = 80
     private var savedBot = 98
@@ -255,12 +241,6 @@ class MainActivity : Activity() {
         })
         treeTv = TextView(this).apply { text = treeLabel() }
         col.addView(treeTv)
-        bkTv = TextView(this).apply { text = bkLabel() }
-        col.addView(bkTv)
-        col.addView(btn("Sauvegarder maintenant (clés, progression, glossaire)") { backupNow(true) })
-        col.addView(btn("Restaurer une sauvegarde (après réinstallation)") {
-            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE), 6)
-        })
         goB = btn("2. Analyser et traduire") { start() }.also { it.isEnabled = false }
         col.addView(goB)
         col.addView(btn("Arrêter (la progression est gardée)") { stop = true })
@@ -414,7 +394,6 @@ class MainActivity : Activity() {
         return try {
             File(filesDir, "glossaire.json").writeText(
                 JSONObject().put("user", JSONObject(userGl.toMap())).put("learned", JSONObject(glossary.toMap())).toString())
-            maybeBackup()
             true
         } catch (e: Exception) { false }
     }
@@ -493,121 +472,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // ===== Sauvegarde hors de l'appli (survit à la désinstallation) =====
-    private val BK_NAME = "manhua_backup.json"
-
-    private fun altFile() = File(filesDir, "v_${base.hashCode()}_$durMs.json")
-
-    private fun bkTree(): Uri? = getSharedPreferences("p", 0).getString("tree", null)?.let { Uri.parse(it) }
-
-    private fun bkLabel(): String {
-        val sp = getSharedPreferences("p", 0)
-        if (bkTree() == null) return "Sauvegarde automatique : choisis d’abord le dossier de sortie pour l’activer."
-        val t = sp.getLong("bkTime", 0L)
-        if (t == 0L) return "Sauvegarde automatique : active (aucune écrite pour l’instant)."
-        return "Dernière sauvegarde : " + java.text.SimpleDateFormat("dd/MM HH:mm", java.util.Locale.getDefault()).format(java.util.Date(t)) + " (" + sp.getInt("bkKb", 0) + " Ko)"
-    }
-
-    private fun buildBackup(): String {
-        val sp = getSharedPreferences("p", 0)
-        val prefs = JSONObject()
-        for (n in listOf("k", "k4", "kg", "ko")) prefs.put(n, sp.getString(n, "") ?: "")
-        prefs.put("asr", sp.getBoolean("asr", false))
-        val files = JSONObject()
-        filesDir.listFiles()?.filter { it.isFile && it.name.endsWith(".json") && !it.name.startsWith("bak_") && it.length() < 40_000_000L }?.forEach { f ->
-            try { val t = f.readText(); JSONObject(t); files.put(f.name, t) } catch (e: Exception) {}
-        }
-        if (uri != null) try {
-            val sfile = sf()
-            if (sfile.exists()) { val t = sfile.readText(); JSONObject(t); files.put(altFile().name, t) }
-        } catch (e: Exception) {}
-        return JSONObject().put("v", 1).put("time", System.currentTimeMillis()).put("prefs", prefs).put("files", files).toString()
-    }
-
-    private fun findBackup(tree: Uri): Uri? {
-        val tid = DocumentsContract.getTreeDocumentId(tree)
-        val kids = DocumentsContract.buildChildDocumentsUriUsingTree(tree, tid)
-        var found: Uri? = null
-        contentResolver.query(kids, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
-            while (c.moveToNext()) if (c.getString(1) == BK_NAME) found = DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0))
-        }
-        return found
-    }
-
-    private fun putBackup(tree: Uri, text: String) {
-        val tid = DocumentsContract.getTreeDocumentId(tree)
-        val parent = DocumentsContract.buildDocumentUriUsingTree(tree, tid)
-        val bytes = text.toByteArray()
-        val ex = findBackup(tree)
-        if (ex != null) {
-            try { contentResolver.openOutputStream(ex, "wt")!!.use { it.write(bytes) }; return }
-            catch (e: Exception) { try { DocumentsContract.deleteDocument(contentResolver, ex) } catch (x: Exception) {} }
-        }
-        val u = DocumentsContract.createDocument(contentResolver, parent, "application/json", BK_NAME) ?: throw Exception("création impossible")
-        contentResolver.openOutputStream(u)!!.use { it.write(bytes) }
-    }
-
-    private fun maybeBackup() { if (System.currentTimeMillis() - lastBk > 120_000L) backupNow(false) }
-
-    private fun backupNow(manual: Boolean) {
-        val tree = bkTree()
-        if (tree == null) { if (manual) st.text = "Choisis d’abord le dossier de sortie : la sauvegarde y sera écrite."; return }
-        if (!bkBusy.compareAndSet(false, true)) return
-        lastBk = System.currentTimeMillis()
-        bkExec.execute {
-            try {
-                val txt = buildBackup()
-                putBackup(tree, txt)
-                getSharedPreferences("p", 0).edit().putLong("bkTime", System.currentTimeMillis()).putInt("bkKb", txt.length / 1024).apply()
-                runOnUiThread { bkTv.text = bkLabel(); if (manual) st.text = "Sauvegarde écrite dans le dossier de sortie ($BK_NAME)." }
-            } catch (e: Exception) {
-                runOnUiThread { bkTv.text = "Sauvegarde impossible : ${e.message}" }
-            } finally { bkBusy.set(false) }
-        }
-    }
-
-    private fun localEmpty(): Boolean {
-        val sp = getSharedPreferences("p", 0)
-        val noKeys = listOf("k", "k4", "kg", "ko").all { (sp.getString(it, "") ?: "").isEmpty() }
-        val noFiles = (filesDir.listFiles()?.none { it.isFile && it.name.endsWith(".json") } ?: true)
-        return noKeys && noFiles
-    }
-
-    private fun restoreFrom(u: Uri) {
-        Thread {
-            try {
-                val txt = contentResolver.openInputStream(u)!!.use { String(it.readBytes(), Charsets.UTF_8) }
-                val o = JSONObject(txt)
-                val files = o.getJSONObject("files")
-                var n = 0
-                files.keys().forEach { name ->
-                    if (name.endsWith(".json") && !name.contains('/') && !name.contains("..")) { File(filesDir, name).writeText(files.getString(name)); n++ }
-                }
-                val p = o.optJSONObject("prefs")
-                val ed = getSharedPreferences("p", 0).edit()
-                if (p != null) {
-                    for (nm in listOf("k", "k4", "kg", "ko")) ed.putString(nm, p.optString(nm, ""))
-                    ed.putBoolean("asr", p.optBoolean("asr", false))
-                }
-                ed.apply()
-                runOnUiThread {
-                    val sp = getSharedPreferences("p", 0)
-                    key.setText(sp.getString("k", "")); key4.setText(sp.getString("k4", "")); key2.setText(sp.getString("kg", "")); key3.setText(sp.getString("ko", ""))
-                    k4 = sp.getString("k4", "") ?: ""
-                    cbAsr.isChecked = sp.getBoolean("asr", false)
-                    userGl.clear(); glossary.clear(); loadGl()
-                    synchronized(phrases) { phrases.clear() }; loadPhrases()
-                    if (uri != null) {
-                        try { loadState() } catch (e: Exception) {}
-                        if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText((savedStart / 60).toString()) }
-                        drawPreview(); renderPanel()
-                    }
-                    st.text = "Sauvegarde restaurée ($n fichiers, clés, glossaire). Choisis la même vidéo pour retrouver la progression, et re-choisis le dossier de sortie."
-                }
-            } catch (e: Exception) { ui("Restauration impossible : ${e.message ?: e}") }
-        }.start()
-    }
-
     private fun treeLabel(): String =
         getSharedPreferences("p", 0).getString("tree", null)?.let { "Dossier de sortie : " + DocumentsContract.getTreeDocumentId(Uri.parse(it)) }
             ?: "Dossier de sortie : Téléchargements (par défaut)"
@@ -619,20 +483,7 @@ class MainActivity : Activity() {
                 try { contentResolver.takePersistableUriPermission(tu, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (e: Exception) {}
                 getSharedPreferences("p", 0).edit().putString("tree", tu.toString()).apply()
                 treeTv.text = treeLabel()
-                val old = try { findBackup(tu) } catch (e: Exception) { null }
-                if (old != null && localEmpty()) {
-                    AlertDialog.Builder(this).setTitle("Sauvegarde trouvée")
-                        .setMessage("Une sauvegarde ($BK_NAME) existe dans ce dossier : clés, progression et glossaire. La restaurer ?\n\nSi tu réponds Non, elle sera remplacée par la nouvelle sauvegarde.")
-                        .setPositiveButton("Oui, restaurer") { _, _ -> restoreFrom(old); backupNow(false) }
-                        .setNegativeButton("Non") { _, _ -> backupNow(false) }.show()
-                } else backupNow(false)
-                bkTv.text = bkLabel()
             }
-            return
-        }
-        if (rq == 6) {
-            val ru = d?.data
-            if (rc == RESULT_OK && ru != null) restoreFrom(ru)
             return
         }
         if (rq == 4) {
@@ -695,7 +546,7 @@ class MainActivity : Activity() {
             saveGl(); return
         }
         val o = JSONObject().put("done", done).put("tp", savedTop).put("bt", savedBot).put("rs", savedStart)
-        o.put("items", JSONArray().also { a -> synchronized(items) { items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } } })
+        o.put("items", JSONArray().also { a -> items.forEach { a.put(JSONArray().put(it.first).put(it.second)) } })
         o.put("memo", JSONObject(memo.toMap())).put("g", JSONObject(glossary.toMap())).put("off", JSONArray(offlineKeys.toList())).put("src", JSONObject(srcMap.toMap())).put("ret", JSONArray(retraSet.toList()))
         o.put("ad", asrDone).put("zf", JSONObject(zhFix.toMap()))
         o.put("asr", JSONArray().also { a -> synchronized(asr) { asr.forEach { sg -> a.put(JSONArray().put(sg.start).put(sg.end).put(sg.text)) } } })
@@ -706,9 +557,7 @@ class MainActivity : Activity() {
     private fun loadState() {
         items.clear(); memo.clear(); offlineKeys.clear(); srcMap.clear(); retraSet.clear(); done = 0.0; cues = listOf(); savedStart = 0.0
         asr.clear(); asrDone = 0.0; zhFix.clear()
-        val f = sf()
-        if (!f.exists()) { val a = altFile(); if (a.exists()) try { a.copyTo(f, overwrite = true) } catch (e: Exception) {} }
-        if (!f.exists()) return
+        val f = sf(); if (!f.exists()) return
         val o = JSONObject(f.readText())
         done = o.optDouble("done", 0.0); savedTop = o.optInt("tp", 80); savedBot = o.optInt("bt", 98); savedStart = o.optDouble("rs", 0.0)
         val a = o.getJSONArray("items")
@@ -776,7 +625,6 @@ class MainActivity : Activity() {
         val k3 = key3.text.toString().trim()
         getSharedPreferences("p", 0).edit().putString("k", k).putString("kg", k2).putString("ko", k3).apply(); k4 = key4.text.toString().trim(); getSharedPreferences("p", 0).edit().putString("k4", k4).apply()
         val ct = sTop.progress; val cb = sBot.progress
-        backupNow(false)
         val full = durMs / 1000.0
         val rs = ((etFrom.text.toString().toDoubleOrNull() ?: 0.0) * 60).coerceAtLeast(0.0)
         val reRaw = (etTo.text.toString().toDoubleOrNull() ?: 0.0) * 60
@@ -794,53 +642,9 @@ class MainActivity : Activity() {
         ensureChannel(this)
         startForegroundService(Intent(this, KeepAliveService::class.java))
         askBackground()
-        val q = java.util.concurrent.LinkedBlockingQueue<List<Cue>>()
-        val poison = ArrayList<Cue>()
-        val werr = java.util.concurrent.atomic.AtomicReference<Exception?>(null)
-        var workerRef: Thread? = null
         Thread {
             try {
                 val dur = re
-                val BATCH = 40
-                var enq = 0
-                var flushedAt = items.size
-                trDone = 0; trQueued = 0
-                // Fil n°2 : pour chaque groupe de 40 lignes lues par l'OCR → audio (vérification) → traduction,
-                // pendant que l'OCR continue à lire la suite de la vidéo.
-                val worker = Thread {
-                    try {
-                        val acc = ArrayList<Cue>()
-                        var ng = 0
-                        while (true) {
-                            val g = q.take()
-                            if (g === poison || stop) break
-                            acc.addAll(g)
-                            cues = ArrayList(acc)
-                            if (g.all { memo[it.zh] != null }) { trDone = cues.count { memo[it.zh] != null }; continue }
-                            if (useAsr) runAsr(minOf(re, g.last().end + 2.0))
-                            if (stop) break
-                            attachHints(g)
-                            if (ng % 5 == 0) autoGlossary(k, k2, k3)
-                            translateAll(k, k2, k3, ng == 0)
-                            ng++
-                            g.forEach { it.ar = memo[it.zh] ?: "" }
-                            trDone = cues.count { memo[it.zh] != null }
-                            saveState()
-                        }
-                    } catch (e: Exception) { werr.set(e) }
-                }
-                workerRef = worker
-                worker.start()
-                // Côté OCR : met en file chaque groupe de 40 lignes terminées (la dernière ligne peut encore changer).
-                fun enqueue(isFinal: Boolean) {
-                    val all = buildCues()
-                    val ready = if (isFinal) all else all.dropLast(1)
-                    while (ready.size - enq >= (if (isFinal) 1 else BATCH)) {
-                        val n = minOf(BATCH, ready.size - enq)
-                        q.put(ready.subList(enq, enq + n).toList())
-                        enq += n; trQueued = enq
-                    }
-                }
                 if (done < dur) {
                     val r = retr()
                     val rec = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
@@ -848,35 +652,34 @@ class MainActivity : Activity() {
                     var prev: IntArray? = null
                     var t = done
                     var ls = System.currentTimeMillis()
-                    while (t < dur && !stop && werr.get() == null) {
+                    while (t < dur && !stop) {
                         val f = r.getFrameAtTime((t * 1_000_000).toLong(), MediaMetadataRetriever.OPTION_CLOSEST)
                         if (f != null) {
                             val b = band(f, ct, cb); val s = sig(b); val p = prev
                             if (p == null || diff(p, s) > 6) {
                                 prev = s
                                 val txt = ocr(rec, b)
-                                if (norm(txt) != norm(last)) { synchronized(items) { items.add(t to txt) }; last = txt }
+                                if (norm(txt) != norm(last)) { items.add(t to txt); last = txt }
                             }
                             if (b !== f) b.recycle()
                             f.recycle()
                         }
                         t += STEP; done = t
-                        if (!stop && items.size - flushedAt >= 10) { flushedAt = items.size; enqueue(false) }
-                        if (System.currentTimeMillis() - ls > 20000) { ls = System.currentTimeMillis(); notifyProgress("Analyse ${hms(t)} / ${hms(dur)} · traduit $trDone / $trQueued") }
-                        phaseInfo = "Analyse ${hms(t)} / ${hms(dur)} · ${items.size} changements · traduit $trDone / $trQueued"; phase = "analyse"
+                        if (System.currentTimeMillis() - ls > 20000) { saveState(); ls = System.currentTimeMillis(); notifyProgress("Analyse ${hms(t)} / ${hms(dur)}") }
+                        phaseInfo = "Analyse ${hms(t)} / ${hms(dur)} · ${items.size} changements"; phase = "analyse"
                         ui(phaseInfo); runOnUiThread { renderPanel() }
                     }
-                    r.release()
+                    r.release(); saveState()
                 }
-                if (!stop && werr.get() == null) enqueue(true)
-                q.put(poison)
-                if (!stop && werr.get() == null) { phase = "traduction"; ui("Lecture terminée : fin de la traduction ($trDone / $trQueued)…") }
-                worker.join()
-                werr.get()?.let { throw it }
-                if (stop) { saveState(); ui("Arrêté. Relance l’analyse pour reprendre."); return@Thread }
+                if (useAsr && !stop) runAsr(re)
+                if (stop) { ui("Arrêté. Relance l’analyse pour reprendre."); return@Thread }
                 cues = buildCues()
                 attachHints(cues)
                 if (cues.isEmpty()) { ui("Aucun sous-titre détecté : vérifie la zone rouge."); return@Thread }
+                ui("${cues.size} sous-titres. Traduction…")
+                autoGlossary(k, k2, k3)
+                translateAll(k, k2, k3)
+                if (stop) { saveState(); ui("Arrêté pendant la traduction. Relance pour reprendre."); return@Thread }
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
                 saveState()
                 val inTree = exportAll()
@@ -888,10 +691,9 @@ class MainActivity : Activity() {
                 lastOk = true
                 runOnUiThread { playB.isEnabled = true }
             } catch (e: Exception) {
-                try { val was = stop; stop = true; q.put(poison); workerRef?.join(); stop = was; saveState() } catch (x: Exception) {}
+                try { saveState() } catch (x: Exception) {}
                 ui("Erreur : ${e.message ?: e}. La progression est gardée : relance pour reprendre.")
             } finally {
-                try { backupNow(false) } catch (e: Exception) {}
                 running = false
                 phase = if (stop) "arrêté" else if (lastOk) "terminé" else "erreur"
                 stopService(Intent(this, KeepAliveService::class.java))
@@ -1034,9 +836,8 @@ class MainActivity : Activity() {
         val total = cues.count { memo[it.zh] != null }
         val head = StringBuilder()
         when {
-            phase == "analyse" && activeName.isEmpty() -> head.append("▶ EN MARCHE : ").append(phaseInfo)
+            phase == "analyse" -> head.append("▶ EN MARCHE : ").append(phaseInfo)
             activeName.isNotEmpty() -> {
-                if (phase == "analyse") head.append("▶ ").append(phaseInfo).append("\n")
                 val cnt = cues.count { srcMap[it.zh] == codeOf(activeName) }
                 val s = synchronized(pstate) { pstate[activeName] ?: "" }
                 head.append("▶ SERVEUR ACTIF : ").append(activeName).append(" — en marche\n   ").append(s)
@@ -1085,27 +886,21 @@ class MainActivity : Activity() {
         panel.text = sp
     }
 
-    private fun translateAll(k1: String, k2: String, k3: String, fresh: Boolean = true) {
-        if (fresh) {
-            fellBack = false; failNotes = ""
-            tUntil.clear(); tBsz.clear(); tPf.clear(); tNetFail.clear(); tDown.clear(); tProbeAt.clear(); tResetKnown.clear(); tBack.clear()
-            synchronized(pReset) { pReset.clear() }
-            transStart = 0L
-        }
+    private fun translateAll(k1: String, k2: String, k3: String) {
+        fellBack = false
+        failNotes = ""
         activeName = ""
         phase = "traduction"
         firstName = if (k1.startsWith("sk-ant")) "Claude" else "Gemini"
         synchronized(pstate) {
-            if (fresh || pstate.isEmpty()) {
             pstate.clear()
             pstate[firstName] = if (k1.isEmpty()) "pas de clé" else "en attente"
             if (k4.isNotEmpty()) pstate["Gemini 2"] = "en attente"
             pstate["Groq"] = if (k2.isEmpty()) "pas de clé" else "en attente"
             pstate["OpenRouter"] = if (k3.isEmpty()) "pas de clé" else "en attente"
             pstate["Hors ligne"] = "prêt"
-            }
         }
-        if (fresh) synchronized(perr) { perr.clear() }
+        synchronized(perr) { perr.clear() }
         runOnUiThread { renderPanel() }
         offDone = 0
         cues.forEach { c -> userGl[c.zh]?.let { memo[c.zh] = it } }
@@ -1127,18 +922,19 @@ class MainActivity : Activity() {
             prepareOffline()
             if (k3.isNotEmpty()) refreshOrQuota(k3)
         }
-        val until = tUntil
-        val bsz = tBsz
-        val pf = tPf
-        val netFail = tNetFail
-        val down = tDown
-        val probeAt = tProbeAt
-        val resetKnown = tResetKnown
-        val back = tBack
+        val until = HashMap<String, Long>()
+        val bsz = HashMap<String, Int>()
+        val pf = HashMap<String, Int>()
+        val netFail = HashMap<String, Int>()
+        val down = HashSet<String>()
+        val probeAt = HashMap<String, Long>()
+        val resetKnown = HashSet<String>()
+        val back = HashSet<String>()
         val far = Long.MAX_VALUE / 4
         var cur = ""
-        if (transStart == 0L) { transStart = System.currentTimeMillis(); transBase = cues.count { memo[it.zh] != null } }
-        chain.forEach { bsz.putIfAbsent(it.name, it.batch) }
+        synchronized(pReset) { pReset.clear() }
+        transStart = System.currentTimeMillis(); transBase = cues.count { memo[it.zh] != null }
+        chain.forEach { bsz[it.name] = it.batch }
         fun probe(name: String): Boolean = try {
             val u: String
             val h = HashMap<String, String>()
