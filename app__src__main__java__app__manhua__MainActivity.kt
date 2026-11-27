@@ -719,8 +719,8 @@ class MainActivity : Activity() {
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
                 saveState()
                 val inTree = exportAll()
-                val where = if (inTree) "dans le dossier choisi : $base.srt (arabe), $base.zh.srt, $base.bilingue.srt" else "dans Téléchargements : $base.ar.srt, $base.zh.srt, $base.bilingue.srt"
-                val fixNote = if (useAsr) (" Audio : ${asr.size} phrases, ${cues.count { zhFix.containsKey(it.zh) }} lignes de chinois corrigées." + (if (asr.isNotEmpty()) " Fichier $base.audio.srt = audio brut." else "") + asrNote) else ""
+                val where = if (inTree) "dans le dossier choisi : ar.$base.srt (arabe), zh.$base.srt, bilingue.$base.srt" else "dans Téléchargements : ar.$base.srt, zh.$base.srt, bilingue.$base.srt"
+                val fixNote = if (useAsr) (" Audio : ${asr.size} phrases, ${cues.count { zhFix.containsKey(it.zh) }} lignes de chinois corrigées." + (if (asr.isNotEmpty()) " Fichier audio.$base.srt = audio brut." else "") + asrNote) else ""
                 val glNote = if (autoGlN > 0) " Glossaire : $autoGlN mots ajoutés automatiquement (à vérifier dans « Mon glossaire »)." else ""
                 val testNote = if (re < full) " Test terminé : vérifie avec « 3. Lire », puis mets Fin = 0 et relance pour toute la vidéo." else ""
                 ui("Terminé ✓ ${cues.size} sous-titres, $where.$testNote$fixNote$glNote" + if (fellBack) " Une partie a été traduite hors ligne. Serveurs en échec : " + failNotes.trim() + "." else "")
@@ -1859,10 +1859,10 @@ class MainActivity : Activity() {
                 translateAll(k, k2, k3)
                 if (stop) { saveState(); ui("Arrêté. Relance le même fichier pour reprendre."); return@Thread }
                 cues.forEach { it.ar = memo[it.zh] ?: "" }
-                val inTree = outFile("$outBase.ar.srt", srt { it.ar })
+                val inTree = outFile("ar.$outBase.srt", srt { it.ar })
                 File(filesDir, "srt_$srtKey.json").delete()
                 lastOk = true
-                ui("SRT traduit ✓ ${cues.size} sous-titres ($srcLang → arabe). Fichier : $outBase.ar.srt " +
+                ui("SRT traduit ✓ ${cues.size} sous-titres ($srcLang → arabe). Fichier : ar.$outBase.srt " +
                     (if (inTree) "dans le dossier de sortie choisi." else "dans Téléchargements."))
             } catch (e: Exception) {
                 try { saveState() } catch (x: Exception) {}
@@ -1909,10 +1909,10 @@ class MainActivity : Activity() {
         val tree = getSharedPreferences("p", 0).getString("tree", null)?.let { Uri.parse(it) }
         if (tree != null) {
             try {
-                putTree(tree, "$base.srt", srt { it.ar })
-                putTree(tree, "$base.zh.srt", srt { zhOf(it) })
-                putTree(tree, "$base.bilingue.srt", srt { zhOf(it) + "\n" + it.ar })
-                if (useAsr && asr.isNotEmpty()) putTree(tree, "$base.audio.srt", audioSrt())
+                putTree(tree, "ar.$base.srt", srt { it.ar })
+                putTree(tree, "zh.$base.srt", srt { zhOf(it) })
+                putTree(tree, "bilingue.$base.srt", srt { zhOf(it) + "\n" + it.ar })
+                if (useAsr && asr.isNotEmpty()) putTree(tree, "audio.$base.srt", audioSrt())
                 return true
             } catch (e: Exception) {}
         }
@@ -1924,10 +1924,10 @@ class MainActivity : Activity() {
             val u = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
             contentResolver.openOutputStream(u)!!.use { it.write(("\uFEFF" + text).toByteArray()) }
         }
-        put("$base.ar.srt", srt { it.ar })
-        put("$base.zh.srt", srt { zhOf(it) })
-        put("$base.bilingue.srt", srt { zhOf(it) + "\n" + it.ar })
-        if (useAsr && asr.isNotEmpty()) put("$base.audio.srt", audioSrt())
+        put("ar.$base.srt", srt { it.ar })
+        put("zh.$base.srt", srt { zhOf(it) })
+        put("bilingue.$base.srt", srt { zhOf(it) + "\n" + it.ar })
+        if (useAsr && asr.isNotEmpty()) put("audio.$base.srt", audioSrt())
         return false
     }
 
