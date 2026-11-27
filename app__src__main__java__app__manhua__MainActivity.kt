@@ -146,6 +146,7 @@ class MainActivity : Activity() {
     @Volatile private var lastFix = HashMap<Int, String>()
     private lateinit var cbAsr: CheckBox
     private lateinit var cbPipe: CheckBox
+    private lateinit var cbNoTr: CheckBox
     @Volatile private var phase = ""
     @Volatile private var phaseInfo = ""
     @Volatile private var lastOk = false
@@ -193,7 +194,7 @@ class MainActivity : Activity() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { drawPreview() }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) { saveZone() }
             })
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(36), dp(16), dp(24)) }
@@ -242,6 +243,10 @@ class MainActivity : Activity() {
             isChecked = getSharedPreferences("p", 0).getBoolean("pipe", true)
         }
         col.addView(cbPipe)
+        cbNoTr = CheckBox(this).apply {
+            text = "Analyser seulement (OCR + son sur toute la plage), sans traduction"
+        }
+        col.addView(cbNoTr)
         col.addView(btn("Choisir le dossier de sortie (celui de la vidéo)") {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 2)
         })
@@ -349,6 +354,8 @@ class MainActivity : Activity() {
             addView(ScrollView(this@MainActivity).apply { addView(gedit) }, LinearLayout.LayoutParams(-1, 0, 1f))
         }
         setContentView(FrameLayout(this).apply {
+            addView(ImageView(this@MainActivity).apply { setImageResource(R.drawable.fond_ecran); scaleType = ImageView.ScaleType.CENTER_CROP }, FrameLayout.LayoutParams(-1, -1))
+            addView(View(this@MainActivity).apply { setBackgroundColor(0xC8FFFFFF.toInt()) }, FrameLayout.LayoutParams(-1, -1))
             addView(ScrollView(this@MainActivity).apply { addView(col) })
             addView(box)
             addView(gbox, FrameLayout.LayoutParams(-1, -1))
@@ -520,12 +527,23 @@ class MainActivity : Activity() {
                 try { loadState() } catch (e: Exception) { items.clear(); memo.clear(); done = 0.0 }
                 runOnUiThread {
                     if (items.isNotEmpty()) { sTop.progress = savedTop; sBot.progress = savedBot; etFrom.setText(hms(savedStart)) }
+                    else {
+                        val z = getSharedPreferences("zones", 0).getString(zoneKey(), null)?.split(",")?.mapNotNull { it.toIntOrNull() }
+                        if (z != null && z.size == 2) { sTop.progress = z[0]; sBot.progress = z[1] } else { sTop.progress = 80; sBot.progress = 98 }
+                        etFrom.setText("0"); etTo.setText("5")
+                    }
                     drawPreview(); renderPanel(); goB.isEnabled = true
                     playB.isEnabled = cues.isNotEmpty() && cues.all { it.ar.isNotEmpty() }
                     st.text = "Durée ${hms(durMs / 1000.0)}." + if (items.isNotEmpty()) " Progression retrouvée : ${hms(done)}." else " Ajuste la zone rouge puis lance l’analyse."
                 }
             } catch (e: Exception) { ui("Vidéo illisible : $e") }
         }.start()
+    }
+
+    private fun zoneKey() = "z" + uri.toString().hashCode()
+    private fun saveZone() {
+        if (uri == null || !::sTop.isInitialized || !::sBot.isInitialized) return
+        getSharedPreferences("zones", 0).edit().putString(zoneKey(), "${sTop.progress},${sBot.progress}").apply()
     }
 
     private fun ui(s: String) { runOnUiThread { st.text = s } }
@@ -655,7 +673,8 @@ class MainActivity : Activity() {
         val re = if (reRaw <= 0.0 || reRaw > full) full else reRaw
         if (re <= rs) { st.text = "La fin doit être après le début."; return }
         useAsr = cbAsr.isChecked
-        val pipe = cbPipe.isChecked && !useAsr
+        val noTr = cbNoTr.isChecked
+        val pipe = cbPipe.isChecked && !useAsr && !noTr
         getSharedPreferences("p", 0).edit().putBoolean("pipe", cbPipe.isChecked).apply()
         getSharedPreferences("p", 0).edit().putBoolean("asr", useAsr).apply()
         if (savedStart != rs) { asr.clear(); asrDone = 0.0 }
@@ -663,6 +682,7 @@ class MainActivity : Activity() {
         done = maxOf(done, rs)
         asrDone = maxOf(asrDone, rs)
         savedTop = ct; savedBot = cb; savedStart = rs; rEnd = re
+        saveZone()
         running = true; stop = false; goB.isEnabled = false; lastOk = false; phase = ""
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ensureChannel(this)
@@ -712,6 +732,14 @@ class MainActivity : Activity() {
                 cues = buildCues()
                 attachHints(cues)
                 if (cues.isEmpty()) { ui("Aucun sous-titre détecté : vérifie la zone rouge."); return@Thread }
+                if (noTr) {
+                    saveState()
+                    val inTree = exportAll(false)
+                    val w = if (inTree) "dans le dossier choisi" else "dans Téléchargements"
+                    ui("Analyse terminée ✓ ${cues.size} sous-titres chinois, SANS traduction. Fichiers $w : zh.$base.srt" + (if (useAsr && asr.isNotEmpty()) ", audio.$base.srt" else "") + ". Pour traduire : décoche « Analyser seulement » et relance avec le même début/fin (l’analyse est gardée).")
+                    lastOk = true
+                    return@Thread
+                }
                 ui("${cues.size} sous-titres. Traduction…")
                 autoGlossary(k, k2, k3)
                 translateAll(k, k2, k3)
@@ -1905,13 +1933,13 @@ class MainActivity : Activity() {
         contentResolver.openOutputStream(u)!!.use { it.write(("\uFEFF" + text).toByteArray()) }
     }
 
-    private fun exportAll(): Boolean {
+    private fun exportAll(withAr: Boolean = true): Boolean {
         val tree = getSharedPreferences("p", 0).getString("tree", null)?.let { Uri.parse(it) }
         if (tree != null) {
             try {
-                putTree(tree, "ar.$base.srt", srt { it.ar })
+                if (withAr) putTree(tree, "ar.$base.srt", srt { it.ar })
                 putTree(tree, "zh.$base.srt", srt { zhOf(it) })
-                putTree(tree, "bilingue.$base.srt", srt { zhOf(it) + "\n" + it.ar })
+                if (withAr) putTree(tree, "bilingue.$base.srt", srt { zhOf(it) + "\n" + it.ar })
                 if (useAsr && asr.isNotEmpty()) putTree(tree, "audio.$base.srt", audioSrt())
                 return true
             } catch (e: Exception) {}
@@ -1924,9 +1952,9 @@ class MainActivity : Activity() {
             val u = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
             contentResolver.openOutputStream(u)!!.use { it.write(("\uFEFF" + text).toByteArray()) }
         }
-        put("ar.$base.srt", srt { it.ar })
+        if (withAr) put("ar.$base.srt", srt { it.ar })
         put("zh.$base.srt", srt { zhOf(it) })
-        put("bilingue.$base.srt", srt { zhOf(it) + "\n" + it.ar })
+        if (withAr) put("bilingue.$base.srt", srt { zhOf(it) + "\n" + it.ar })
         if (useAsr && asr.isNotEmpty()) put("audio.$base.srt", audioSrt())
         return false
     }
